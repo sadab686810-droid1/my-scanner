@@ -225,55 +225,172 @@ jobs:
           # BHAVCOPY
           # ============================================================
 
+          def normalize_bhavcopy_columns(df):
+
+              rename_map = {
+                  "SYMBOL": "TckrSymb",
+                  "Symbol": "TckrSymb",
+                  "TckrSymb": "TckrSymb",
+                  "SERIES": "SctySrs",
+                  "Series": "SctySrs",
+                  "SctySrs": "SctySrs",
+                  "OPEN_PRICE": "OpnPric",
+                  "Open Price": "OpnPric",
+                  "OPEN": "OpnPric",
+                  "OpnPric": "OpnPric",
+                  "HIGH_PRICE": "HghPric",
+                  "High Price": "HghPric",
+                  "HIGH": "HghPric",
+                  "HghPric": "HghPric",
+                  "LOW_PRICE": "LwPric",
+                  "Low Price": "LwPric",
+                  "LOW": "LwPric",
+                  "LwPric": "LwPric",
+                  "CLOSE_PRICE": "ClsPric",
+                  "Close Price": "ClsPric",
+                  "CLOSE": "ClsPric",
+                  "ClsPric": "ClsPric"
+              }
+
+              actual = {}
+              for col in df.columns:
+                  clean = str(col).strip()
+                  if clean in rename_map:
+                      actual[clean] = rename_map[clean]
+
+              df = df.rename(columns=actual)
+
+              required = [
+                  "TckrSymb", "SctySrs", "OpnPric",
+                  "HghPric", "LwPric", "ClsPric"
+              ]
+
+              missing = [x for x in required if x not in df.columns]
+
+              if missing:
+                  raise Exception(
+                      "BHAVCOPY REQUIRED COLUMNS MISSING: "
+                      + ", ".join(missing)
+                      + " | AVAILABLE: "
+                      + ", ".join(map(str, df.columns))
+                  )
+
+              return df
+
+
           def get_bhavcopy(date_obj):
-
-              date_string = date_obj.strftime("%Y%m%d")
-
-              url = (
-                  "https://nsearchives.nseindia.com/content/cm/"
-                  f"BhavCopy_NSE_CM_0_0_0_{date_string}_F_0000.csv.zip"
-              )
 
               headers = {
                   "User-Agent":
                       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 "
-                      "Chrome/120.0 Safari/537.36"
+                      "AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
+                  "Accept": "*/*",
+                  "Referer": "https://www.nseindia.com/"
               }
 
-              r = requests.get(
-                  url,
-                  headers=headers,
-                  timeout=30
-              )
+              # Try requested previous weekday and step backwards so NSE
+              # holidays do not break the scanner.
+              candidate_dates = []
+              d = date_obj
 
-              print(
-                  "UDIFF HTTP:",
-                  r.status_code,
-                  "SIZE:",
-                  len(r.content)
-              )
+              for _ in range(7):
+                  if d.weekday() < 5:
+                      candidate_dates.append(d)
+                  d -= timedelta(days=1)
 
-              r.raise_for_status()
+              last_error = None
 
-              with zipfile.ZipFile(
-                  io.BytesIO(r.content)
-              ) as z:
+              for trade_date in candidate_dates:
 
-                  csv_files = [
-                      x for x in z.namelist()
-                      if x.lower().endswith(".csv")
-                  ]
+                  date_string = trade_date.strftime("%Y%m%d")
+                  ddmmyyyy = trade_date.strftime("%d%m%Y")
 
-                  if not csv_files:
-                      raise Exception(
-                          "CSV NOT FOUND IN BHAVCOPY ZIP"
+                  # ----------------------------------------------------
+                  # SOURCE 1: UDiFF Common Bhavcopy ZIP
+                  # ----------------------------------------------------
+                  udiff_url = (
+                      "https://nsearchives.nseindia.com/content/cm/"
+                      f"BhavCopy_NSE_CM_0_0_0_{date_string}_F_0000.csv.zip"
+                  )
+
+                  try:
+                      r = requests.get(
+                          udiff_url,
+                          headers=headers,
+                          timeout=30
                       )
 
-                  with z.open(csv_files[0]) as f:
-                      df = pd.read_csv(f)
+                      print(
+                          "UDIFF:", trade_date,
+                          "HTTP:", r.status_code,
+                          "SIZE:", len(r.content)
+                      )
 
-              return df
+                      if r.status_code == 200:
+                          try:
+                              with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+                                  csv_files = [
+                                      x for x in z.namelist()
+                                      if x.lower().endswith(".csv")
+                                  ]
+
+                                  if not csv_files:
+                                      raise Exception(
+                                          "CSV NOT FOUND IN UDIFF ZIP"
+                                      )
+
+                                  with z.open(csv_files[0]) as f:
+                                      df = pd.read_csv(f)
+
+                              df = normalize_bhavcopy_columns(df)
+                              print("BHAVCOPY SOURCE: UDIFF")
+                              print("BHAVCOPY DATE USED:", trade_date)
+                              return df
+
+                          except Exception as e:
+                              print("UDIFF READ ERROR:", e)
+                              last_error = e
+
+                  except Exception as e:
+                      print("UDIFF REQUEST ERROR:", e)
+                      last_error = e
+
+                  # ----------------------------------------------------
+                  # SOURCE 2: NSE security bhavdata CSV fallback
+                  # ----------------------------------------------------
+                  fallback_url = (
+                      "https://nsearchives.nseindia.com/"
+                      f"products/content/sec_bhavdata_full_{ddmmyyyy}.csv"
+                  )
+
+                  try:
+                      r2 = requests.get(
+                          fallback_url,
+                          headers=headers,
+                          timeout=30
+                      )
+
+                      print(
+                          "FALLBACK:", trade_date,
+                          "HTTP:", r2.status_code,
+                          "SIZE:", len(r2.content)
+                      )
+
+                      if r2.status_code == 200:
+                          df = pd.read_csv(io.StringIO(r2.text))
+                          df = normalize_bhavcopy_columns(df)
+                          print("BHAVCOPY SOURCE: SEC_BHAVDATA_FULL")
+                          print("BHAVCOPY DATE USED:", trade_date)
+                          return df
+
+                  except Exception as e:
+                      print("FALLBACK READ ERROR:", e)
+                      last_error = e
+
+              raise Exception(
+                  f"NSE BHAVCOPY NOT AVAILABLE FOR {date_obj} "
+                  f"OR PREVIOUS 7 DAYS. LAST ERROR: {last_error}"
+              )
 
 
           # ============================================================
@@ -1571,6 +1688,13 @@ jobs:
           PYCODE
 
       # ============================================================
+      # SYNTAX CHECK
+      # ============================================================
+      - name: Check scanner syntax
+        run: |
+          python -m py_compile prev_low_break_sell.py
+
+      # ============================================================
       # RUN
       # ============================================================
       - name: Run PREV LOW BREAK SELL
@@ -1583,4 +1707,4 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
         run: |
-          python prev_low_break_sell.py.github/workflows/poro_low_breakout.yml
+          python prev_low_break_sell.py
