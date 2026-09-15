@@ -1,0 +1,1586 @@
+
+name: PREV LOW BREAK SELL
+
+on:
+  schedule:
+    # 09:10 IST = 03:40 UTC
+    - cron: '40 3 * * 1-5'
+
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ============================================================
+      # PYTHON
+      # ============================================================
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      # ============================================================
+      # INSTALL
+      # ============================================================
+      - name: Install packages
+        run: |
+          pip install smartapi-python websocket-client requests pandas pyotp logzero
+
+      # ============================================================
+      # CREATE SCANNER
+      # ============================================================
+      - name: Create scanner
+        env:
+          ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
+          ANGEL_CLIENT_ID: ${{ secrets.ANGEL_CLIENT_ID }}
+          ANGEL_PASSWORD: ${{ secrets.ANGEL_PASSWORD }}
+          ANGEL_TOTP: ${{ secrets.ANGEL_TOTP }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+        run: |
+
+          cat > prev_low_break_sell.py <<'PYCODE'
+
+          import os
+          import time
+          import json
+          import zipfile
+          import io
+          import threading
+          import requests
+          import pandas as pd
+          import pyotp
+
+          from datetime import datetime, timedelta, time as dt_time
+          from zoneinfo import ZoneInfo
+
+          from SmartApi import SmartConnect
+          from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+
+
+          # ============================================================
+          # TIMEZONE
+          # ============================================================
+
+          IST = ZoneInfo("Asia/Kolkata")
+
+
+          # ============================================================
+          # SETTINGS
+          # ============================================================
+
+          START_TIME = dt_time(9, 15)
+          STOP_TIME = dt_time(15, 0)
+
+          MIN_BODY_PERCENT = 0.60
+
+          OPEN_HIGH_ABS_TOLERANCE = 0.05
+          OPEN_HIGH_REL_TOLERANCE = 0.00005
+
+          NIFTY500_URL = (
+              "https://nsearchives.nseindia.com/"
+              "content/indices/ind_nifty500list.csv"
+          )
+
+          SCRIPT_MASTER_URL = (
+              "https://margincalculator.angelone.in/"
+              "OpenAPI_File/files/OpenAPIScripMaster.json"
+          )
+
+
+          # ============================================================
+          # TELEGRAM
+          # ============================================================
+
+          TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+          TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+
+          def telegram(message):
+
+              if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+                  print("TELEGRAM SECRETS NOT FOUND")
+                  return False
+
+              url = (
+                  f"https://api.telegram.org/bot"
+                  f"{TELEGRAM_BOT_TOKEN}/sendMessage"
+              )
+
+              try:
+
+                  r = requests.post(
+                      url,
+                      data={
+                          "chat_id": TELEGRAM_CHAT_ID,
+                          "text": message
+                      },
+                      timeout=15
+                  )
+
+                  if r.status_code == 200:
+                      return True
+
+                  print(
+                      "TELEGRAM ERROR:",
+                      r.status_code,
+                      r.text
+                  )
+
+              except Exception as e:
+
+                  print(
+                      "TELEGRAM EXCEPTION:",
+                      e
+                  )
+
+              return False
+
+
+          # ============================================================
+          # HEADER
+          # ============================================================
+
+          print()
+          print("=" * 70)
+          print("🔻 PREV LOW BREAK SELL SCANNER")
+          print("=" * 70)
+          print()
+          print("NIFTY 500 ONLY")
+          print("PREVIOUS DAY: OPEN = HIGH")
+          print("PREVIOUS DAY: BEARISH")
+          print("PREVIOUS DAY: BODY >= 60%")
+          print("PREVIOUS DAY LOW = BREAKOUT LEVEL")
+          print("TODAY: 5-MINUTE CANDLES")
+          print("SIGNAL: 5-MIN CLOSE < PREVIOUS DAY LOW")
+          print("FIRST SELL SIGNAL ONLY")
+          print("TELEGRAM: EVERY 5 MINUTES")
+          print("START: 09:15 IST")
+          print("STOP: 15:00 IST")
+          print("WEBSOCKET ONLY")
+          print("=" * 70)
+          print()
+
+
+          # ============================================================
+          # NIFTY 500
+          # ============================================================
+
+          def get_nifty500():
+
+              headers = {
+                  "User-Agent":
+                      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 "
+                      "Chrome/120.0 Safari/537.36"
+              }
+
+              r = requests.get(
+                  NIFTY500_URL,
+                  headers=headers,
+                  timeout=30
+              )
+
+              r.raise_for_status()
+
+              df = pd.read_csv(
+                  io.StringIO(r.text)
+              )
+
+              symbols = []
+
+              for _, row in df.iterrows():
+
+                  symbol = str(
+                      row.get("Symbol", "")
+                  ).strip().upper()
+
+                  if symbol:
+                      symbols.append(symbol)
+
+              return sorted(set(symbols))
+
+
+          # ============================================================
+          # PREVIOUS TRADING DAY
+          # ============================================================
+
+          def get_previous_trading_day():
+
+              now = datetime.now(IST).date()
+
+              d = now - timedelta(days=1)
+
+              while d.weekday() >= 5:
+                  d -= timedelta(days=1)
+
+              return d
+
+
+          # ============================================================
+          # BHAVCOPY
+          # ============================================================
+
+          def get_bhavcopy(date_obj):
+
+              date_string = date_obj.strftime("%Y%m%d")
+
+              url = (
+                  "https://nsearchives.nseindia.com/content/cm/"
+                  f"BhavCopy_NSE_CM_0_0_0_{date_string}_F_0000.csv.zip"
+              )
+
+              headers = {
+                  "User-Agent":
+                      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 "
+                      "Chrome/120.0 Safari/537.36"
+              }
+
+              r = requests.get(
+                  url,
+                  headers=headers,
+                  timeout=30
+              )
+
+              print(
+                  "UDIFF HTTP:",
+                  r.status_code,
+                  "SIZE:",
+                  len(r.content)
+              )
+
+              r.raise_for_status()
+
+              with zipfile.ZipFile(
+                  io.BytesIO(r.content)
+              ) as z:
+
+                  csv_files = [
+                      x for x in z.namelist()
+                      if x.lower().endswith(".csv")
+                  ]
+
+                  if not csv_files:
+                      raise Exception(
+                          "CSV NOT FOUND IN BHAVCOPY ZIP"
+                      )
+
+                  with z.open(csv_files[0]) as f:
+                      df = pd.read_csv(f)
+
+              return df
+
+
+          # ============================================================
+          # PREVIOUS DAY SELL SETUPS
+          # ============================================================
+
+          def build_setups(
+              nifty_symbols,
+              bhav
+          ):
+
+              print(
+                  "EQ ROWS:",
+                  len(bhav)
+              )
+
+
+              # --------------------------------------------------------
+              # EQ ONLY
+              # --------------------------------------------------------
+
+              if "SctySrs" in bhav.columns:
+
+                  bhav = bhav[
+                      bhav["SctySrs"]
+                      .astype(str)
+                      .str.upper()
+                      .eq("EQ")
+                  ].copy()
+
+
+              # --------------------------------------------------------
+              # NIFTY 500 ROW COUNT
+              # --------------------------------------------------------
+
+              print(
+                  "NIFTY 500 ROWS IN BHAVCOPY:",
+                  len(
+                      bhav[
+                          bhav["TckrSymb"]
+                          .astype(str)
+                          .str.upper()
+                          .isin(nifty_symbols)
+                      ]
+                  )
+                  if "TckrSymb" in bhav.columns
+                  else 0
+              )
+
+
+              required = [
+                  "TckrSymb",
+                  "OpnPric",
+                  "HghPric",
+                  "LwPric",
+                  "ClsPric"
+              ]
+
+              for col in required:
+
+                  if col not in bhav.columns:
+
+                      raise Exception(
+                          f"BHAVCOPY COLUMN NOT FOUND: {col}"
+                      )
+
+
+              setups = {}
+
+
+              for _, row in bhav.iterrows():
+
+                  symbol = str(
+                      row["TckrSymb"]
+                  ).strip().upper()
+
+
+                  if symbol not in nifty_symbols:
+                      continue
+
+
+                  try:
+
+                      o = float(row["OpnPric"])
+                      h = float(row["HghPric"])
+                      l = float(row["LwPric"])
+                      c = float(row["ClsPric"])
+
+                  except Exception:
+
+                      continue
+
+
+                  candle_range = h - l
+
+                  if candle_range <= 0:
+                      continue
+
+
+                  # ----------------------------------------------------
+                  # OPEN = HIGH
+                  # ----------------------------------------------------
+
+                  tolerance = max(
+                      OPEN_HIGH_ABS_TOLERANCE,
+                      abs(o) * OPEN_HIGH_REL_TOLERANCE
+                  )
+
+                  if abs(o - h) > tolerance:
+                      continue
+
+
+                  # ----------------------------------------------------
+                  # BEARISH
+                  # ----------------------------------------------------
+
+                  if c >= o:
+                      continue
+
+
+                  # ----------------------------------------------------
+                  # BODY %
+                  # ----------------------------------------------------
+
+                  body_percent = (
+                      abs(c - o) / candle_range
+                  )
+
+
+                  if body_percent < MIN_BODY_PERCENT:
+                      continue
+
+
+                  setups[symbol] = {
+                      "open": o,
+                      "high": h,
+                      "low": l,
+                      "close": c,
+                      "body_percent": body_percent * 100
+                  }
+
+
+              return setups
+
+
+          # ============================================================
+          # ANGEL SCRIPT MASTER
+          # ============================================================
+
+          def get_script_master():
+
+              print()
+              print(
+                  "DOWNLOADING ANGEL SCRIPT MASTER..."
+              )
+
+
+              r = requests.get(
+                  SCRIPT_MASTER_URL,
+                  timeout=60
+              )
+
+              r.raise_for_status()
+
+              data = r.json()
+
+
+              print(
+                  "ANGEL SCRIPT MASTER:",
+                  len(data)
+              )
+
+
+              token_map = {}
+
+
+              for item in data:
+
+                  try:
+
+                      if str(
+                          item.get("exch_seg", "")
+                      ).upper() != "NSE":
+                          continue
+
+
+                      symbol = str(
+                          item.get("symbol", "")
+                      ).upper().strip()
+
+
+                      if not symbol.endswith("-EQ"):
+                          continue
+
+
+                      base_symbol = symbol[:-3]
+
+
+                      token = str(
+                          item.get("token", "")
+                      ).strip()
+
+
+                      if base_symbol and token:
+
+                          token_map[
+                              base_symbol
+                          ] = token
+
+                  except Exception:
+
+                      continue
+
+
+              print(
+                  "NSE EQ TOKEN MAP:",
+                  len(token_map)
+              )
+
+
+              return token_map
+
+
+          # ============================================================
+          # 5-MINUTE WEBSOCKET ENGINE
+          # ============================================================
+
+          class FiveMinuteEngine:
+
+              def __init__(
+                  self,
+                  setups,
+                  api_key,
+                  client_code,
+                  auth_token,
+                  feed_token
+              ):
+
+                  self.setups = setups
+
+                  self.api_key = api_key
+                  self.client_code = client_code
+                  self.auth_token = auth_token
+                  self.feed_token = feed_token
+
+                  self.ws = None
+
+                  self.running = True
+
+                  self.candles = {}
+
+                  self.signal_sent = set()
+
+                  self.last_report_bucket = None
+
+                  self.lock = threading.Lock()
+
+
+              # --------------------------------------------------------
+              # NOW
+              # --------------------------------------------------------
+
+              def now(self):
+
+                  return datetime.now(IST)
+
+
+              # --------------------------------------------------------
+              # MARKET OPEN
+              # --------------------------------------------------------
+
+              def market_open(self):
+
+                  t = self.now().time()
+
+                  return (
+                      t >= START_TIME
+                      and t < STOP_TIME
+                  )
+
+
+              # --------------------------------------------------------
+              # 5-MIN BUCKET
+              # --------------------------------------------------------
+
+              def get_bucket(self, dt):
+
+                  minute = (
+                      dt.minute // 5
+                  ) * 5
+
+                  return dt.replace(
+                      minute=minute,
+                      second=0,
+                      microsecond=0
+                  )
+
+
+              # --------------------------------------------------------
+              # FINALIZE CANDLE
+              # --------------------------------------------------------
+
+              def finalize_candle(
+                  self,
+                  symbol,
+                  candle
+              ):
+
+                  if not candle:
+                      return
+
+
+                  bucket = candle["bucket"]
+
+                  o = candle["open"]
+                  h = candle["high"]
+                  l = candle["low"]
+                  c = candle["close"]
+
+
+                  pdl = self.setups[
+                      symbol
+                  ]["low"]
+
+
+                  print(
+                      f"{bucket.strftime('%H:%M')} "
+                      f"{symbol} "
+                      f"O {o:.2f} "
+                      f"H {h:.2f} "
+                      f"L {l:.2f} "
+                      f"C {c:.2f} "
+                      f"PDL {pdl:.2f}"
+                  )
+
+
+                  # ----------------------------------------------------
+                  # SELL SIGNAL
+                  # ----------------------------------------------------
+
+                  if (
+                      symbol not in self.signal_sent
+                      and c < pdl
+                  ):
+
+                      self.signal_sent.add(
+                          symbol
+                      )
+
+
+                      msg = (
+                          "🔻 PREV LOW BREAK SELL\n\n"
+                          f"📌 STOCK: {symbol}\n"
+                          f"⏰ CANDLE: "
+                          f"{bucket.strftime('%H:%M')} IST\n"
+                          f"💰 CLOSE: ₹{c:.2f}\n"
+                          f"📉 PREV LOW: ₹{pdl:.2f}\n"
+                          f"🔥 BREAK: ₹{pdl - c:.2f}\n\n"
+                          "NIFTY 500\n"
+                          "5-MIN CLOSE < PREVIOUS DAY LOW"
+                      )
+
+
+                      print()
+                      print(msg)
+                      print()
+
+
+                      telegram(msg)
+
+
+              # --------------------------------------------------------
+              # PROCESS TICK
+              # --------------------------------------------------------
+
+              def process_tick(
+                  self,
+                  symbol,
+                  price,
+                  tick_time
+              ):
+
+                  if symbol not in self.setups:
+                      return
+
+
+                  bucket = self.get_bucket(
+                      tick_time
+                  )
+
+
+                  with self.lock:
+
+                      old = self.candles.get(
+                          symbol
+                      )
+
+
+                      # ------------------------------------------------
+                      # NEW CANDLE
+                      # ------------------------------------------------
+
+                      if old is not None:
+
+                          if old["bucket"] != bucket:
+
+                              self.finalize_candle(
+                                  symbol,
+                                  old
+                              )
+
+                              old = None
+
+
+                      # ------------------------------------------------
+                      # CREATE NEW CANDLE
+                      # ------------------------------------------------
+
+                      if old is None:
+
+                          self.candles[symbol] = {
+                              "bucket": bucket,
+                              "open": price,
+                              "high": price,
+                              "low": price,
+                              "close": price
+                          }
+
+                      else:
+
+                          old["high"] = max(
+                              old["high"],
+                              price
+                          )
+
+                          old["low"] = min(
+                              old["low"],
+                              price
+                          )
+
+                          old["close"] = price
+
+
+              # --------------------------------------------------------
+              # TELEGRAM 5-MIN UPDATE
+              # --------------------------------------------------------
+
+              def send_periodic_report(self):
+
+                  now = self.now()
+
+
+                  if not self.market_open():
+                      return
+
+
+                  bucket = self.get_bucket(
+                      now
+                  )
+
+
+                  first_report_time = (
+                      datetime.combine(
+                          now.date(),
+                          START_TIME,
+                          tzinfo=IST
+                      )
+                      + timedelta(minutes=5)
+                  )
+
+
+                  if now < first_report_time:
+                      return
+
+
+                  if self.last_report_bucket == bucket:
+                      return
+
+
+                  self.last_report_bucket = bucket
+
+
+                  # ----------------------------------------------------
+                  # SELL SIGNALS
+                  # ----------------------------------------------------
+
+                  if self.signal_sent:
+
+                      signal_list = ", ".join(
+                          sorted(
+                              self.signal_sent
+                          )
+                      )
+
+
+                      msg = (
+                          "📊 PREV LOW BREAK SELL UPDATE\n\n"
+                          f"⏰ {now.strftime('%H:%M')} IST\n"
+                          "🔴 SELL SIGNALS ALREADY FOUND:\n"
+                          f"{signal_list}\n\n"
+                          "🔎 Scanner continues..."
+                      )
+
+                  else:
+
+                      msg = (
+                          "📊 PREV LOW BREAK SELL UPDATE\n\n"
+                          f"⏰ {now.strftime('%H:%M')} IST\n"
+                          "⚪ NO SELL SIGNAL\n\n"
+                          "5-MINUTE SCAN COMPLETE\n"
+                          "Scanner continues..."
+                      )
+
+
+                  print()
+                  print(msg)
+                  print()
+
+
+                  telegram(msg)
+
+
+              # --------------------------------------------------------
+              # WEBSOCKET OPEN
+              # --------------------------------------------------------
+
+              def on_open(self, wsapp):
+
+                  print()
+                  print(
+                      "=========================================="
+                  )
+                  print(
+                      "WEBSOCKET CONNECTED"
+                  )
+                  print(
+                      "=========================================="
+                  )
+                  print()
+
+
+                  token_list = [
+                      {
+                          "exchangeType": 1,
+                          "tokens": [
+                              str(x["token"])
+                              for x in self.setups.values()
+                          ]
+                      }
+                  ]
+
+
+                  try:
+
+                      self.ws.subscribe(
+                          "prevlowbreaksell",
+                          1,
+                          token_list
+                      )
+
+
+                      print(
+                          "SUBSCRIPTION SUCCESS"
+                      )
+
+
+                      print(
+                          "STOCKS SUBSCRIBED:",
+                          len(self.setups)
+                      )
+
+
+                      telegram(
+                          "🔻 PREV LOW BREAK SELL SCANNER STARTED\n\n"
+                          f"📊 Stocks: {len(self.setups)}\n"
+                          "⏱️ 5-minute candle scan\n"
+                          "📉 Signal: CLOSE < PREVIOUS DAY LOW\n"
+                          "📡 WebSocket LIVE\n\n"
+                          "Telegram update every 5 minutes."
+                      )
+
+
+                  except Exception as e:
+
+                      print(
+                          "SUBSCRIPTION ERROR:",
+                          e
+                      )
+
+
+                      telegram(
+                          "❌ PREV LOW BREAK SELL\n\n"
+                          "WebSocket subscription failed.\n\n"
+                          f"ERROR: {e}"
+                      )
+
+
+              # --------------------------------------------------------
+              # WEBSOCKET DATA
+              # --------------------------------------------------------
+
+              def on_data(
+                  self,
+                  wsapp,
+                  message
+              ):
+
+                  try:
+
+                      if isinstance(
+                          message,
+                          str
+                      ):
+
+                          data = json.loads(
+                              message
+                          )
+
+                      else:
+
+                          data = message
+
+
+                      if not isinstance(
+                          data,
+                          dict
+                      ):
+                          return
+
+
+                      token = str(
+                          data.get(
+                              "token",
+                              ""
+                          )
+                      )
+
+
+                      ltp_raw = data.get(
+                          "last_traded_price"
+                      )
+
+
+                      if not token or ltp_raw is None:
+                          return
+
+
+                      price = (
+                          float(ltp_raw)
+                          / 100.0
+                      )
+
+
+                      # ------------------------------------------------
+                      # TOKEN -> SYMBOL
+                      # ------------------------------------------------
+
+                      symbol = None
+
+
+                      for s, setup in self.setups.items():
+
+                          if str(
+                              setup["token"]
+                          ) == token:
+
+                              symbol = s
+                              break
+
+
+                      if symbol is None:
+                          return
+
+
+                      # ------------------------------------------------
+                      # EXCHANGE TIMESTAMP
+                      # ------------------------------------------------
+
+                      exchange_ts = data.get(
+                          "exchange_timestamp"
+                      )
+
+
+                      if exchange_ts:
+
+                          try:
+
+                              ts = float(
+                                  exchange_ts
+                              )
+
+
+                              if ts > 100000000000:
+                                  ts /= 1000
+
+
+                              tick_time = (
+                                  datetime
+                                  .fromtimestamp(
+                                      ts,
+                                      tz=IST
+                                  )
+                              )
+
+
+                          except Exception:
+
+                              tick_time = self.now()
+
+                      else:
+
+                          tick_time = self.now()
+
+
+                      if tick_time.time() < START_TIME:
+                          return
+
+
+                      if tick_time.time() >= STOP_TIME:
+                          return
+
+
+                      self.process_tick(
+                          symbol,
+                          price,
+                          tick_time
+                      )
+
+
+                  except Exception as e:
+
+                      print(
+                          "TICK ERROR:",
+                          e
+                      )
+
+
+              # --------------------------------------------------------
+              # ERROR
+              # --------------------------------------------------------
+
+              def on_error(
+                  self,
+                  wsapp,
+                  error
+              ):
+
+                  print()
+                  print(
+                      "WEBSOCKET ERROR:",
+                      error
+                  )
+                  print()
+
+
+                  telegram(
+                      "⚠️ PREV LOW BREAK SELL "
+                      "WEBSOCKET ERROR\n\n"
+                      f"{error}"
+                  )
+
+
+              # --------------------------------------------------------
+              # CLOSE
+              # --------------------------------------------------------
+
+              def on_close(
+                  self,
+                  wsapp,
+                  close_code,
+                  close_reason
+              ):
+
+                  print()
+                  print(
+                      "WEBSOCKET CLOSED:",
+                      close_code,
+                      close_reason
+                  )
+                  print()
+
+
+              # --------------------------------------------------------
+              # CONTROL
+              # --------------------------------------------------------
+
+              def on_control_message(
+                  self,
+                  wsapp,
+                  message
+              ):
+
+                  print(
+                      "CONTROL:",
+                      message
+                  )
+
+
+              # --------------------------------------------------------
+              # RUN
+              # --------------------------------------------------------
+
+              def run(self):
+
+                  print()
+                  print(
+                      "CREATING ANGEL WEBSOCKET..."
+                  )
+
+
+                  self.ws = SmartWebSocketV2(
+                      self.auth_token,
+                      self.api_key,
+                      self.client_code,
+                      self.feed_token
+                  )
+
+
+                  self.ws.on_open = self.on_open
+                  self.ws.on_data = self.on_data
+                  self.ws.on_error = self.on_error
+                  self.ws.on_close = self.on_close
+                  self.ws.on_control_message = (
+                      self.on_control_message
+                  )
+
+
+                  # ----------------------------------------------------
+                  # TELEGRAM REPORT THREAD
+                  # ----------------------------------------------------
+
+                  def reporter():
+
+                      while self.running:
+
+                          try:
+
+                              self.send_periodic_report()
+
+                          except Exception as e:
+
+                              print(
+                                  "REPORT ERROR:",
+                                  e
+                              )
+
+                          time.sleep(10)
+
+
+                  thread = threading.Thread(
+                      target=reporter,
+                      daemon=True
+                  )
+
+
+                  thread.start()
+
+
+                  # ----------------------------------------------------
+                  # CONNECT
+                  # ----------------------------------------------------
+
+                  try:
+
+                      self.ws.connect()
+
+                  except KeyboardInterrupt:
+
+                      print(
+                          "STOPPED BY USER"
+                      )
+
+                  except Exception as e:
+
+                      print(
+                          "WEBSOCKET CONNECT ERROR:",
+                          e
+                      )
+
+
+                      telegram(
+                          "❌ PREV LOW BREAK SELL\n\n"
+                          "WebSocket connection failed.\n\n"
+                          f"{e}"
+                      )
+
+
+          # ============================================================
+          # WAIT UNTIL 09:15
+          # ============================================================
+
+          def wait_until_start():
+
+              while True:
+
+                  now = datetime.now(IST)
+
+                  t = now.time()
+
+
+                  if t >= START_TIME:
+
+                      print()
+                      print(
+                          "09:15 REACHED"
+                      )
+
+                      return
+
+
+                  if t >= STOP_TIME:
+
+                      print(
+                          "MARKET SCAN WINDOW CLOSED."
+                      )
+
+                      return
+
+
+                  remaining = (
+                      datetime.combine(
+                          now.date(),
+                          START_TIME,
+                          tzinfo=IST
+                      )
+                      - now
+                  )
+
+
+                  seconds = max(
+                      1,
+                      int(
+                          remaining.total_seconds()
+                      )
+                  )
+
+
+                  print(
+                      f"WAITING FOR 09:15 IST "
+                      f"({seconds}s)"
+                  )
+
+
+                  time.sleep(
+                      min(
+                          30,
+                          seconds
+                      )
+                  )
+
+
+          # ============================================================
+          # MAIN
+          # ============================================================
+
+          def main():
+
+              try:
+
+                  # ----------------------------------------------------
+                  # NIFTY 500
+                  # ----------------------------------------------------
+
+                  nifty500 = get_nifty500()
+
+
+                  print(
+                      "NIFTY 500 STOCKS:",
+                      len(nifty500)
+                  )
+
+
+                  # ----------------------------------------------------
+                  # PREVIOUS DAY
+                  # ----------------------------------------------------
+
+                  previous_day = (
+                      get_previous_trading_day()
+                  )
+
+
+                  print(
+                      "PREVIOUS TRADING DAY:",
+                      previous_day
+                  )
+
+
+                  # ----------------------------------------------------
+                  # BHAVCOPY
+                  # ----------------------------------------------------
+
+                  bhav = get_bhavcopy(
+                      previous_day
+                  )
+
+
+                  # ----------------------------------------------------
+                  # SELL SETUPS
+                  # ----------------------------------------------------
+
+                  setups = build_setups(
+                      set(nifty500),
+                      bhav
+                  )
+
+
+                  print()
+                  print(
+                      "QUALIFIED PREVIOUS DAY "
+                      "SELL SETUPS:",
+                      len(setups)
+                  )
+                  print()
+
+
+                  for symbol, x in sorted(
+                      setups.items()
+                  ):
+
+                      print(
+                          f"{symbol} "
+                          f"O {x['open']:.2f} "
+                          f"H {x['high']:.2f} "
+                          f"L {x['low']:.2f} "
+                          f"C {x['close']:.2f} "
+                          f"BODY "
+                          f"{x['body_percent']:.2f}% "
+                          f"PDL {x['low']:.2f}"
+                      )
+
+
+                  print()
+                  print(
+                      "QUALIFIED PREVIOUS DAY "
+                      "SELL SETUPS:",
+                      len(setups)
+                  )
+
+
+                  if not setups:
+
+                      print(
+                          "NO QUALIFIED SELL STOCKS."
+                      )
+
+
+                      telegram(
+                          "ℹ️ PREV LOW BREAK SELL\n\n"
+                          "No qualified NIFTY 500 "
+                          "previous-day SELL setup today."
+                      )
+
+
+                      return
+
+
+                  # ----------------------------------------------------
+                  # ANGEL SCRIPT MASTER
+                  # ----------------------------------------------------
+
+                  token_map = (
+                      get_script_master()
+                  )
+
+
+                  final_setups = {}
+
+
+                  for symbol, setup in setups.items():
+
+                      token = token_map.get(
+                          symbol
+                      )
+
+
+                      if token:
+
+                          setup["token"] = token
+
+                          final_setups[
+                              symbol
+                          ] = setup
+
+
+                  print()
+                  print(
+                      "QUALIFIED STOCKS WITH "
+                      "ANGEL TOKEN:",
+                      len(final_setups)
+                  )
+
+
+                  for symbol, setup in sorted(
+                      final_setups.items()
+                  ):
+
+                      print(
+                          f"{symbol} -> "
+                          f"{setup['token']}"
+                      )
+
+
+                  print()
+                  print(
+                      "FINAL STOCKS TO WATCH:",
+                      len(final_setups)
+                  )
+
+
+                  if not final_setups:
+
+                      telegram(
+                          "❌ PREV LOW BREAK SELL\n\n"
+                          "No Angel token found for "
+                          "qualified SELL stocks."
+                      )
+
+
+                      return
+
+
+                  # ----------------------------------------------------
+                  # WAIT 09:15
+                  # ----------------------------------------------------
+
+                  print()
+                  print(
+                      "WAITING FOR 09:15 IST"
+                  )
+
+
+                  wait_until_start()
+
+
+                  now = datetime.now(
+                      IST
+                  )
+
+
+                  if now.time() >= STOP_TIME:
+
+                      print(
+                          "MARKET SCAN WINDOW CLOSED."
+                      )
+
+                      return
+
+
+                  # ----------------------------------------------------
+                  # ANGEL SECRETS
+                  # ----------------------------------------------------
+
+                  api_key = os.getenv(
+                      "ANGEL_API_KEY"
+                  )
+
+                  client_code = os.getenv(
+                      "ANGEL_CLIENT_ID"
+                  )
+
+                  password = os.getenv(
+                      "ANGEL_PASSWORD"
+                  )
+
+                  totp_secret = os.getenv(
+                      "ANGEL_TOTP"
+                  )
+
+
+                  if not all([
+                      api_key,
+                      client_code,
+                      password,
+                      totp_secret
+                  ]):
+
+                      raise Exception(
+                          "ANGEL SECRETS MISSING"
+                      )
+
+
+                  # ----------------------------------------------------
+                  # GENERATE CURRENT TOTP
+                  # ----------------------------------------------------
+
+                  totp = pyotp.TOTP(
+                      totp_secret
+                      .replace(" ", "")
+                      .strip()
+                  ).now()
+
+
+                  print(
+                      "TOTP GENERATED SUCCESSFULLY"
+                  )
+
+
+                  # ----------------------------------------------------
+                  # ANGEL LOGIN
+                  # ----------------------------------------------------
+
+                  obj = SmartConnect(
+                      api_key=api_key
+                  )
+
+
+                  data = obj.generateSession(
+                      client_code,
+                      password,
+                      totp
+                  )
+
+
+                  if not data.get(
+                      "status",
+                      False
+                  ):
+
+                      print(
+                          "ANGEL LOGIN FAILED:"
+                      )
+
+                      print(data)
+
+
+                      telegram(
+                          "❌ PREV LOW BREAK SELL\n\n"
+                          "Angel One login failed."
+                      )
+
+
+                      return
+
+
+                  print(
+                      "ANGEL LOGIN SUCCESS"
+                  )
+
+
+                  auth_token = data[
+                      "data"
+                  ][
+                      "jwtToken"
+                  ]
+
+
+                  feed_token = (
+                      obj.getfeedToken()
+                  )
+
+
+                  # ----------------------------------------------------
+                  # START ENGINE
+                  # ----------------------------------------------------
+
+                  engine = FiveMinuteEngine(
+                      final_setups,
+                      api_key,
+                      client_code,
+                      auth_token,
+                      feed_token
+                  )
+
+
+                  engine.run()
+
+
+              except Exception as e:
+
+                  print()
+                  print(
+                      "FATAL ERROR:",
+                      e
+                  )
+                  print()
+
+
+                  telegram(
+                      "🚨 PREV LOW BREAK SELL "
+                      "FATAL ERROR\n\n"
+                      f"{e}"
+                  )
+
+
+                  raise
+
+
+          # ============================================================
+          # START
+          # ============================================================
+
+          if __name__ == "__main__":
+              main()
+
+          PYCODE
+
+      # ============================================================
+      # RUN
+      # ============================================================
+      - name: Run PREV LOW BREAK SELL
+        env:
+          ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
+          ANGEL_CLIENT_ID: ${{ secrets.ANGEL_CLIENT_ID }}
+          ANGEL_PASSWORD: ${{ secrets.ANGEL_PASSWORD }}
+          ANGEL_TOTP: ${{ secrets.ANGEL_TOTP }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+        run: |
+          python prev_low_break_sell.py.github/workflows/poro_low_breakout.yml
