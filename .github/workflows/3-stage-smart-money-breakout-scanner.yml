@@ -8,8 +8,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  scanner:
-
+  scan:
     runs-on: ubuntu-latest
 
     timeout-minutes: 120
@@ -19,28 +18,26 @@ jobs:
       # ============================================================
       # CHECKOUT
       # ============================================================
-
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
 
       # ============================================================
       # PYTHON
       # ============================================================
-
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
 
       # ============================================================
-      # INSTALL
+      # INSTALL PACKAGES
       # ============================================================
-
-      - name: Install packages
+      - name: Install Packages
         run: |
           python -m pip install --upgrade pip
+
           pip install smartapi-python
           pip install websocket-client
           pip install pyotp
@@ -51,16 +48,15 @@ jobs:
       # ============================================================
       # CREATE SCANNER
       # ============================================================
-
-      - name: Create scanner.py
+      - name: Create Scanner
         env:
           ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
           ANGEL_CLIENT_ID: ${{ secrets.ANGEL_CLIENT_ID }}
           ANGEL_PASSWORD: ${{ secrets.ANGEL_PASSWORD }}
           ANGEL_TOTP: ${{ secrets.ANGEL_TOTP }}
 
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELE_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELE_CHAT_ID }}
+          TELE_TOKEN: ${{ secrets.TELE_TOKEN }}
+          TELE_CHAT_ID: ${{ secrets.TELE_CHAT_ID }}
 
         run: |
 
@@ -73,14 +69,30 @@ jobs:
           import requests
           import pyotp
 
-          from datetime import datetime, time as dt_time
+          from datetime import datetime, time as dt_time, timezone
+          from zoneinfo import ZoneInfo
 
           from SmartApi import SmartConnect
           from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
 
           # ============================================================
-          # GITHUB SECRETS
+          # INDIA TIMEZONE
+          # ============================================================
+
+          IST = ZoneInfo("Asia/Kolkata")
+
+
+          def now_ist():
+              return datetime.now(IST)
+
+
+          def market_time():
+              return now_ist().time()
+
+
+          # ============================================================
+          # ANGEL ONE CREDENTIALS
           # ============================================================
 
           API_KEY = os.getenv("ANGEL_API_KEY")
@@ -88,997 +100,778 @@ jobs:
           PASSWORD = os.getenv("ANGEL_PASSWORD")
           TOTP_SECRET = os.getenv("ANGEL_TOTP")
 
-          TELEGRAM_BOT_TOKEN = os.getenv("TELE_TOKEN")
-          TELEGRAM_CHAT_ID = os.getenv("TELE_CHAT_ID")
+
+          # ============================================================
+          # TELEGRAM
+          # ============================================================
+
+          TELE_TOKEN = os.getenv("TELE_TOKEN")
+          TELE_CHAT_ID = os.getenv("TELE_CHAT_ID")
 
 
           # ============================================================
-          # ONLY 5 STOCKS
+          # STOCKS
           # ============================================================
 
           STOCKS = {
+
               "2885": "RELIANCE",
               "1333": "HDFCBANK",
               "1594": "INFY",
               "3045": "SBIN",
               "3456": "ICICIBANK",
+
           }
-
-
-          # ============================================================
-          # TIME
-          # ============================================================
-
-          START_TIME = dt_time(9, 15, 0)
-          END_TIME = dt_time(11, 0, 0)
-
-
-          # ============================================================
-          # ASK SETTINGS
-          # ============================================================
-
-          # Approximate Ask wall around 3000
-
-          ASK_TARGET = 3000
-
-          ASK_TOLERANCE = 150
-
-
-          # ============================================================
-          # WATCH SETTINGS
-          # ============================================================
-
-          # Minimum observations required before confirmation
-
-          MIN_WATCH_OBSERVATIONS = 3
-
-          # Seconds between observations
-
-          MIN_OBSERVATION_SECONDS = 1.0
-
-
-          # ============================================================
-          # ASK REPLENISHMENT
-          # ============================================================
-
-          # If Ask comes down and then rebuilds near 3000,
-          # count it as replenishment.
-
-          REPLENISH_MIN_DROP = 300
-
-          REPLENISH_MIN_QTY = 2700
-
-
-          # ============================================================
-          # BID WEAKNESS
-          # ============================================================
-
-          # Bid should be meaningfully smaller than Ask.
-
-          MAX_BID_TO_ASK_RATIO = 0.40
-
-
-          # ============================================================
-          # PRICE CONFIRMATION
-          # ============================================================
-
-          # LTP must be close to Ask but fail to cross it.
-
-          MAX_PRICE_DISTANCE_FROM_ASK = 0.002
-
-
-          # ============================================================
-          # SELL CONFIRMATION
-          # ============================================================
-
-          MIN_CONFIRM_OBSERVATIONS = 2
-
-          PRICE_REJECTION_TICKS = 2
-
-
-          # ============================================================
-          # SIGNAL COOLDOWN
-          # ============================================================
-
-          SIGNAL_COOLDOWN_SECONDS = 300
-
-
-          # ============================================================
-          # STATE
-          # ============================================================
-
-          observations = {}
-
-          last_observation_time = {}
-
-          signal_time = {}
-
-          running = True
-
-          sws = None
 
 
           # ============================================================
           # MARKET TIME
           # ============================================================
 
-          def market_time():
-
-              return datetime.now().time()
-
-
-          def market_open():
-
-              now = market_time()
-
-              return START_TIME <= now < END_TIME
+          START_TIME = dt_time(9, 15, 0)
+          END_TIME   = dt_time(11, 0, 0)
 
 
           # ============================================================
-          # TELEGRAM
+          # PAUL STYLE ASK WALL
+          # ============================================================
+
+          ASK_TARGET = 3000
+          ASK_TOLERANCE = 150
+
+          ASK_MIN = ASK_TARGET - ASK_TOLERANCE
+          ASK_MAX = ASK_TARGET + ASK_TOLERANCE
+
+
+          # ============================================================
+          # REPLENISHMENT
+          # ============================================================
+
+          REPLENISH_DROP = 300
+          REPLENISH_MIN = 2700
+
+
+          # ============================================================
+          # WEAK BID
+          # ============================================================
+
+          WEAK_BID_RATIO = 0.40
+
+
+          # ============================================================
+          # PRICE CONDITION
+          # ============================================================
+
+          PRICE_NEAR_PERCENT = 0.002
+
+
+          # ============================================================
+          # OBSERVATION SETTINGS
+          # ============================================================
+
+          MIN_OBSERVATIONS = 3
+          OBSERVATION_INTERVAL = 1.0
+
+
+          # ============================================================
+          # SIGNAL COOLDOWN
+          # ============================================================
+
+          SIGNAL_COOLDOWN = 300
+
+
+          # ============================================================
+          # GLOBAL DATA
+          # ============================================================
+
+          data = {}
+
+          last_signal_time = {}
+
+          previous_ltp = {}
+
+
+          # ============================================================
+          # WEBSOCKET OBJECT
+          # ============================================================
+
+          sws = None
+
+
+          # ============================================================
+          # TELEGRAM FUNCTION
           # ============================================================
 
           def send_telegram(message):
 
-              if not TELE_TOKEN or not TELE_CHAT_ID:
-
-                  print("Telegram secrets missing")
-
+              if not TELE_TOKEN:
+                  print("⚠️ TELE_TOKEN missing")
                   return
+
+              if not TELE_CHAT_ID:
+                  print("⚠️ TELE_CHAT_ID missing")
+                  return
+
+              url = (
+                  f"https://api.telegram.org/bot"
+                  f"{TELE_TOKEN}/sendMessage"
+              )
+
+              payload = {
+                  "chat_id": TELE_CHAT_ID,
+                  "text": message
+              }
 
               try:
 
-                  url = (
-                      f"https://api.telegram.org/"
-                      f"bot{TELE_TOKEN}/sendMessage"
-                  )
-
                   response = requests.post(
-
                       url,
-
-                      data={
-                          "chat_id": TELE_CHAT_ID,
-                          "text": message
-                      },
-
+                      data=payload,
                       timeout=10
                   )
 
-                  if response.status_code != 200:
+                  if response.ok:
+                      print("📲 Telegram sent")
 
+                  else:
                       print(
-                          "Telegram HTTP error:",
+                          "❌ Telegram error:",
                           response.status_code,
                           response.text
                       )
 
               except Exception as e:
 
-                  print("Telegram error:", e)
-
-
-          # ============================================================
-          # CSV
-          # ============================================================
-
-          def save_signal(
-              name,
-              token,
-              ask,
-              bid,
-              ltp,
-              replenishments
-          ):
-
-              filename = "paul_sell_signals.csv"
-
-              file_exists = os.path.exists(filename)
-
-              try:
-
-                  with open(
-                      filename,
-                      "a",
-                      newline="",
-                      encoding="utf-8"
-                  ) as f:
-
-                      writer = csv.writer(f)
-
-                      if not file_exists:
-
-                          writer.writerow([
-                              "Time",
-                              "Stock",
-                              "Token",
-                              "AskQty",
-                              "BidQty",
-                              "LTP",
-                              "Replenishments",
-                              "Signal"
-                          ])
-
-                      writer.writerow([
-
-                          datetime.now().strftime(
-                              "%Y-%m-%d %H:%M:%S"
-                          ),
-
-                          name,
-
-                          token,
-
-                          ask,
-
-                          bid,
-
-                          ltp,
-
-                          replenishments,
-
-                          "SELL"
-                      ])
-
-              except Exception as e:
-
-                  print("CSV error:", e)
-
-
-          # ============================================================
-          # APPROXIMATE CHECK
-          # ============================================================
-
-          def approximately(
-              value,
-              target,
-              tolerance
-          ):
-
-              if value is None:
-
-                  return False
-
-              return abs(
-                  value - target
-              ) <= tolerance
-
-
-          # ============================================================
-          # RESET
-          # ============================================================
-
-          def reset_stock(token):
-
-              observations[token] = []
-
-              last_observation_time[token] = 0
-
-
-          # ============================================================
-          # DEPTH EXTRACTION
-          # ============================================================
-
-          def get_depth(tick):
-
-              ask_qty = 0
-              bid_qty = 0
-
-              ask_price = 0.0
-              bid_price = 0.0
-              ltp = 0.0
-
-              try:
-
-                  # -----------------------------------------------
-                  # LTP
-                  # -----------------------------------------------
-
-                  raw_ltp = tick.get(
-                      "last_traded_price",
-                      0
-                  )
-
-                  if raw_ltp:
-
-                      ltp = float(raw_ltp)
-
-                      # Angel One often returns price * 100
-                      if ltp > 10000:
-
-                          ltp = ltp / 100.0
-
-
-                  # -----------------------------------------------
-                  # SELL DEPTH
-                  # -----------------------------------------------
-
-                  sell_data = tick.get(
-                      "best_5_sell_data",
-                      []
-                  )
-
-                  # -----------------------------------------------
-                  # BUY DEPTH
-                  # -----------------------------------------------
-
-                  buy_data = tick.get(
-                      "best_5_buy_data",
-                      []
-                  )
-
-
-                  if sell_data:
-
-                      first_sell = sell_data[0]
-
-                      ask_qty = int(
-                          first_sell.get(
-                              "quantity",
-                              0
-                          )
-                      )
-
-                      ask_price = float(
-                          first_sell.get(
-                              "price",
-                              0
-                          )
-                      )
-
-                      if ask_price > 10000:
-
-                          ask_price /= 100.0
-
-
-                  if buy_data:
-
-                      first_buy = buy_data[0]
-
-                      bid_qty = int(
-                          first_buy.get(
-                              "quantity",
-                              0
-                          )
-                      )
-
-                      bid_price = float(
-                          first_buy.get(
-                              "price",
-                              0
-                          )
-                      )
-
-                      if bid_price > 10000:
-
-                          bid_price /= 100.0
-
-
-              except Exception as e:
-
                   print(
-                      "Depth extraction error:",
+                      "❌ Telegram exception:",
                       e
                   )
 
 
-              return (
-                  ask_qty,
-                  bid_qty,
-                  ask_price,
-                  bid_price,
-                  ltp
-              )
+          # ============================================================
+          # CSV FILE
+          # ============================================================
+
+          CSV_FILE = "paul_sell_signals.csv"
+
+
+          def save_signal(stock, info):
+
+              file_exists = os.path.exists(CSV_FILE)
+
+              with open(
+                  CSV_FILE,
+                  "a",
+                  newline="",
+                  encoding="utf-8"
+              ) as f:
+
+                  writer = csv.writer(f)
+
+                  if not file_exists:
+
+                      writer.writerow([
+                          "TIME",
+                          "STOCK",
+                          "LTP",
+                          "BID_QTY",
+                          "ASK_QTY",
+                          "BID_PRICE",
+                          "ASK_PRICE",
+                          "REASON"
+                      ])
+
+
+                  writer.writerow([
+
+                      now_ist().strftime(
+                          "%Y-%m-%d %H:%M:%S"
+                      ),
+
+                      stock,
+
+                      info.get("ltp"),
+
+                      info.get("bid_qty"),
+
+                      info.get("ask_qty"),
+
+                      info.get("bid_price"),
+
+                      info.get("ask_price"),
+
+                      "PAUL STYLE ORDER BOOK SELL"
+
+                  ])
 
 
           # ============================================================
-          # PROCESS TICK
+          # PROCESS SNAP QUOTE
           # ============================================================
 
-          def process_tick(tick):
-
-              global running
-
-              if not running:
-
-                  return
-
-              if not market_open():
-
-                  return
+          def process_quote(token, quote):
 
               try:
 
-                  token = str(
-                      tick.get("token")
+                  stock = STOCKS.get(str(token))
+
+                  if not stock:
+                      return
+
+
+                  # ----------------------------------------------------
+                  # LTP
+                  # ----------------------------------------------------
+
+                  ltp = quote.get("last_traded_price", 0)
+
+                  # Angel often sends price in paise
+                  ltp = float(ltp) / 100
+
+
+                  # ----------------------------------------------------
+                  # BEST 5 BUY / SELL
+                  # ----------------------------------------------------
+
+                  depth = quote.get(
+                      "depth",
+                      {}
                   )
 
-                  if token not in STOCKS:
 
-                      return
+                  buy_data = depth.get(
+                      "buy",
+                      []
+                  )
 
-                  name = STOCKS[token]
-
-
-                  (
-                      ask_qty,
-                      bid_qty,
-                      ask_price,
-                      bid_price,
-                      ltp
-                  ) = get_depth(tick)
+                  sell_data = depth.get(
+                      "sell",
+                      []
+                  )
 
 
-                  if ask_qty <= 0:
-
-                      return
-
-                  if bid_qty <= 0:
-
+                  if not buy_data or not sell_data:
                       return
 
 
-                  if ask_price <= 0:
+                  best_bid = buy_data[0]
+                  best_ask = sell_data[0]
+
+
+                  bid_qty = float(
+                      best_bid.get(
+                          "quantity",
+                          0
+                      )
+                  )
+
+                  ask_qty = float(
+                      best_ask.get(
+                          "quantity",
+                          0
+                      )
+                  )
+
+
+                  bid_price = float(
+                      best_bid.get(
+                          "price",
+                          0
+                      )
+                  ) / 100
+
+
+                  ask_price = float(
+                      best_ask.get(
+                          "price",
+                          0
+                      )
+                  ) / 100
+
+
+                  # ----------------------------------------------------
+                  # FIRST OBSERVATION
+                  # ----------------------------------------------------
+
+                  if stock not in data:
+
+                      data[stock] = {
+                          "observations": [],
+                          "last_observation": 0
+                      }
+
+
+                  state = data[stock]
+
+                  current_time = time.time()
+
+
+                  # ----------------------------------------------------
+                  # 1 SECOND OBSERVATION
+                  # ----------------------------------------------------
+
+                  if (
+                      current_time
+                      - state["last_observation"]
+                      < OBSERVATION_INTERVAL
+                  ):
+                      return
+
+
+                  state["last_observation"] = current_time
+
+
+                  # ----------------------------------------------------
+                  # ASK WALL
+                  # ----------------------------------------------------
+
+                  ask_wall = (
+                      ASK_MIN
+                      <= ask_qty
+                      <= ASK_MAX
+                  )
+
+
+                  # ----------------------------------------------------
+                  # WEAK BID
+                  # ----------------------------------------------------
+
+                  weak_bid = False
+
+                  if ask_qty > 0:
+
+                      weak_bid = (
+                          bid_qty / ask_qty
+                          <= WEAK_BID_RATIO
+                      )
+
+
+                  # ----------------------------------------------------
+                  # PRICE NEAR ASK
+                  # ----------------------------------------------------
+
+                  price_near_ask = False
+
+                  if ask_price > 0:
+
+                      distance = (
+                          ask_price - ltp
+                      ) / ask_price
+
+                      price_near_ask = (
+                          0
+                          <= distance
+                          <= PRICE_NEAR_PERCENT
+                      )
+
+
+                  # ----------------------------------------------------
+                  # PRICE FAILED
+                  # ----------------------------------------------------
+
+                  price_failed = False
+
+                  if ask_price > 0:
+
+                      price_failed = (
+                          ltp <= ask_price
+                      )
+
+
+                  # ----------------------------------------------------
+                  # ASK REPLENISHMENT
+                  # ----------------------------------------------------
+
+                  replenishment = False
+
+                  observations = state[
+                      "observations"
+                  ]
+
+                  if observations:
+
+                      previous_ask = observations[-1][
+                          "ask_qty"
+                      ]
+
+                      replenishment = (
+
+                          previous_ask
+                          - ask_qty
+                          >= REPLENISH_DROP
+
+                          and
+
+                          ask_qty
+                          >= REPLENISH_MIN
+                      )
+
+
+                  # ----------------------------------------------------
+                  # SAVE OBSERVATION
+                  # ----------------------------------------------------
+
+                  observation = {
+
+                      "time": now_ist(),
+
+                      "ltp": ltp,
+
+                      "bid_qty": bid_qty,
+
+                      "ask_qty": ask_qty,
+
+                      "bid_price": bid_price,
+
+                      "ask_price": ask_price,
+
+                      "ask_wall": ask_wall,
+
+                      "weak_bid": weak_bid,
+
+                      "price_near_ask": price_near_ask,
+
+                      "price_failed": price_failed,
+
+                      "replenishment": replenishment
+
+                  }
+
+
+                  observations.append(
+                      observation
+                  )
+
+
+                  # Keep only latest observations
+                  if len(observations) > 10:
+
+                      observations.pop(0)
+
+
+                  print(
+                      f"{stock:<12} "
+                      f"LTP={ltp:.2f} "
+                      f"BID={bid_qty:.0f} "
+                      f"ASK={ask_qty:.0f} "
+                      f"ASK_WALL={ask_wall} "
+                      f"WEAK_BID={weak_bid} "
+                      f"FAIL={price_failed} "
+                      f"REPLENISH={replenishment}"
+                  )
+
+
+                  # ----------------------------------------------------
+                  # WATCH STAGE
+                  # ----------------------------------------------------
+
+                  if len(observations) < MIN_OBSERVATIONS:
 
                       return
 
 
-                  if ltp <= 0:
+                  # ----------------------------------------------------
+                  # CONFIRM STAGE
+                  # ----------------------------------------------------
+
+                  last_two = observations[-2:]
+
+
+                  ask_wall_count = sum(
+                      1
+                      for x in last_two
+                      if x["ask_wall"]
+                  )
+
+
+                  weak_bid_count = sum(
+                      1
+                      for x in last_two
+                      if x["weak_bid"]
+                  )
+
+
+                  price_fail_count = sum(
+                      1
+                      for x in last_two
+                      if x["price_failed"]
+                  )
+
+
+                  price_near_count = sum(
+                      1
+                      for x in last_two
+                      if x["price_near_ask"]
+                  )
+
+
+                  replenishment_count = sum(
+                      1
+                      for x in last_two
+                      if x["replenishment"]
+                  )
+
+
+                  # ----------------------------------------------------
+                  # CONFIRM CONDITIONS
+                  # ----------------------------------------------------
+
+                  confirmed = (
+
+                      ask_wall_count >= 2
+
+                      and
+
+                      weak_bid_count >= 2
+
+                      and
+
+                      price_fail_count >= 2
+
+                      and
+
+                      price_near_count >= 2
+
+                      and
+
+                      replenishment_count >= 1
+
+                  )
+
+
+                  if not confirmed:
 
                       return
 
 
-                  # ==================================================
-                  # OBSERVATION TIMING
-                  # ==================================================
+                  # ----------------------------------------------------
+                  # LTP MUST BE FALLING
+                  # ----------------------------------------------------
 
-                  now = time.time()
+                  previous = previous_ltp.get(
+                      stock
+                  )
 
-                  previous = last_observation_time.get(
-                      token,
+
+                  if previous is not None:
+
+                      if ltp >= previous:
+
+                          previous_ltp[
+                              stock
+                          ] = ltp
+
+                          return
+
+
+                  previous_ltp[
+                      stock
+                  ] = ltp
+
+
+                  # ----------------------------------------------------
+                  # COOLDOWN
+                  # ----------------------------------------------------
+
+                  now_timestamp = time.time()
+
+                  last_signal = last_signal_time.get(
+                      stock,
                       0
                   )
 
+
                   if (
-                      now - previous
-                      < MIN_OBSERVATION_SECONDS
+                      now_timestamp
+                      - last_signal
+                      < SIGNAL_COOLDOWN
                   ):
 
                       return
 
-                  last_observation_time[token] = now
+
+                  # ----------------------------------------------------
+                  # SELL SIGNAL
+                  # ----------------------------------------------------
+
+                  last_signal_time[
+                      stock
+                  ] = now_timestamp
 
 
-                  # ==================================================
-                  # ASK WALL CHECK
-                  # ==================================================
+                  message = (
 
-                  ask_near_target = approximately(
+                      "🔴 PAUL STYLE SELL SIGNAL\n\n"
 
-                      ask_qty,
+                      f"📌 {stock}\n"
 
-                      ASK_TARGET,
+                      f"💰 LTP: ₹{ltp:.2f}\n"
 
-                      ASK_TOLERANCE
+                      f"🟢 Bid Qty: {bid_qty:.0f}\n"
+
+                      f"🔴 Ask Qty: {ask_qty:.0f}\n"
+
+                      f"📉 Bid/Ask: "
+                      f"{bid_qty / ask_qty:.2f}\n"
+
+                      f"💥 Ask Replenishment: YES\n"
+
+                      f"❌ Price Failed Near Ask\n\n"
+
+                      f"⏰ "
+                      f"{now_ist().strftime('%H:%M:%S')} IST"
+
                   )
 
 
-                  if not ask_near_target:
-
-                      # Do not immediately erase all history.
-                      # But if Ask becomes very far from target,
-                      # reset the pattern.
-
-                      if (
-                          ask_qty
-                          < ASK_TARGET - ASK_TOLERANCE * 2
-                          or
-                          ask_qty
-                          > ASK_TARGET + ASK_TOLERANCE * 2
-                      ):
-
-                          reset_stock(token)
-
-                      return
+                  print()
+                  print("=" * 70)
+                  print(message)
+                  print("=" * 70)
+                  print()
 
 
-                  # ==================================================
-                  # BID WEAKNESS
-                  # ==================================================
-
-                  bid_ratio = (
-                      bid_qty / ask_qty
-                      if ask_qty > 0
-                      else 999
+                  send_telegram(
+                      message
                   )
 
 
-                  bid_weak = (
-                      bid_ratio
-                      <= MAX_BID_TO_ASK_RATIO
+                  save_signal(
+                      stock,
+                      info=observation
                   )
-
-
-                  if not bid_weak:
-
-                      return
-
-
-                  # ==================================================
-                  # PRICE VS ASK
-                  # ==================================================
-
-                  price_distance = (
-
-                      (ask_price - ltp)
-                      / ask_price
-
-                      if ask_price > 0
-                      else 999
-                  )
-
-
-                  price_near_ask = (
-
-                      0
-                      <= price_distance
-                      <= MAX_PRICE_DISTANCE_FROM_ASK
-                  )
-
-
-                  # Price should not already be strongly above Ask.
-
-                  price_failed = (
-                      ltp <= ask_price
-                  )
-
-
-                  # ==================================================
-                  # CURRENT OBSERVATION
-                  # ==================================================
-
-                  current = observations.get(
-                      token,
-                      []
-                  )
-
-
-                  previous_obs = (
-                      current[-1]
-                      if current
-                      else None
-                  )
-
-
-                  replenished = False
-
-
-                  if previous_obs:
-
-                      previous_ask = previous_obs[
-                          "ask"
-                      ]
-
-                      # Ask was consumed/reduced
-                      # and then rebuilt.
-
-                      if (
-
-                          previous_ask
-                          - ask_qty
-                          >= REPLENISH_MIN_DROP
-
-                          and
-
-                          ask_qty
-                          >= REPLENISH_MIN_QTY
-
-                      ):
-
-                          replenished = True
-
-
-                  # ==================================================
-                  # STORE OBSERVATION
-                  # ==================================================
-
-                  current.append({
-
-                      "time":
-                          datetime.now().strftime(
-                              "%H:%M:%S"
-                          ),
-
-                      "ask":
-                          ask_qty,
-
-                      "bid":
-                          bid_qty,
-
-                      "ask_price":
-                          ask_price,
-
-                      "bid_price":
-                          bid_price,
-
-                      "ltp":
-                          ltp,
-
-                      "bid_ratio":
-                          bid_ratio,
-
-                      "replenished":
-                          replenished,
-
-                      "price_near_ask":
-                          price_near_ask,
-
-                      "price_failed":
-                          price_failed
-                  })
-
-
-                  # Keep last 10 observations.
-
-                  if len(current) > 10:
-
-                      current = current[-10:]
-
-
-                  observations[token] = current
-
-
-                  # ==================================================
-                  # STAGE 1 — WATCH
-                  # ==================================================
-
-                  if len(current) == 1:
-
-                      print(
-                          f"\n🔵 WATCH {name}"
-                      )
-
-                      print(
-                          f"ASK={ask_qty} "
-                          f"BID={bid_qty} "
-                          f"LTP={ltp:.2f}"
-                      )
-
-
-                  # ==================================================
-                  # STAGE 2 — CONFIRM
-                  # ==================================================
-
-                  if len(current) >= MIN_WATCH_OBSERVATIONS:
-
-                      recent = current[
-                          -MIN_CONFIRM_OBSERVATIONS:
-                      ]
-
-
-                      weak_bid_count = sum(
-
-                          1
-
-                          for x in recent
-
-                          if x["bid_ratio"]
-                          <= MAX_BID_TO_ASK_RATIO
-                      )
-
-
-                      price_fail_count = sum(
-
-                          1
-
-                          for x in recent
-
-                          if (
-                              x["price_failed"]
-                              and
-                              x["price_near_ask"]
-                          )
-                      )
-
-
-                      replenishment_count = sum(
-
-                          1
-
-                          for x in current
-
-                          if x["replenished"]
-                      )
-
-
-                      ask_count = sum(
-
-                          1
-
-                          for x in recent
-
-                          if approximately(
-                              x["ask"],
-                              ASK_TARGET,
-                              ASK_TOLERANCE
-                          )
-                      )
-
-
-                      confirm = (
-
-                          weak_bid_count
-                          >= MIN_CONFIRM_OBSERVATIONS
-
-                          and
-
-                          price_fail_count
-                          >= MIN_CONFIRM_OBSERVATIONS
-
-                          and
-
-                          ask_count
-                          >= MIN_CONFIRM_OBSERVATIONS
-
-                          and
-
-                          replenishment_count
-                          >= 1
-                      )
-
-
-                      if confirm:
-
-                          print(
-                              f"\n🟡 CONFIRM {name}"
-                          )
-
-                          print(
-                              f"Ask wall maintained: "
-                              f"{ask_count}/"
-                              f"{len(recent)}"
-                          )
-
-                          print(
-                              f"Weak bid: "
-                              f"{weak_bid_count}/"
-                              f"{len(recent)}"
-                          )
-
-                          print(
-                              f"Price rejection: "
-                              f"{price_fail_count}/"
-                              f"{len(recent)}"
-                          )
-
-                          print(
-                              f"Ask replenishments: "
-                              f"{replenishment_count}"
-                          )
-
-
-                          # ==================================================
-                          # STAGE 3 — SELL
-                          # ==================================================
-
-                          last_signal = signal_time.get(
-                              token,
-                              0
-                          )
-
-
-                          if (
-                              now - last_signal
-                              < SIGNAL_COOLDOWN_SECONDS
-                          ):
-
-                              return
-
-
-                          # Need current price to be moving away
-                          # from Ask.
-
-                          if (
-                              len(current) >= 2
-                          ):
-
-                              previous_ltp = current[-2][
-                                  "ltp"
-                              ]
-
-                              current_ltp = current[-1][
-                                  "ltp"
-                              ]
-
-                              price_down = (
-                                  current_ltp
-                                  < previous_ltp
-                              )
-
-                          else:
-
-                              price_down = False
-
-
-                          if price_down:
-
-                              signal_time[token] = now
-
-
-                              first = current[0]
-
-                              last = current[-1]
-
-
-                              message = (
-
-                                  "🚨 PAUL-STYLE "
-                                  "ORDER BOOK SELL\n\n"
-
-                                  f"Stock: {name}\n"
-                                  f"Token: {token}\n\n"
-
-                                  "🔵 WATCH\n"
-                                  f"Ask ≈ {ASK_TARGET}\n\n"
-
-                                  "🟡 CONFIRM\n"
-                                  f"Ask: {first['ask']}"
-                                  " → "
-                                  f"{last['ask']}\n"
-
-                                  f"Bid: {first['bid']}"
-                                  " → "
-                                  f"{last['bid']}\n"
-
-                                  f"LTP: "
-                                  f"{last['ltp']:.2f}\n\n"
-
-                                  f"Ask Replenishments: "
-                                  f"{replenishment_count}\n"
-
-                                  "Bid Weakness: ✅\n"
-                                  "Price Rejection: ✅\n"
-                                  "Price Moving Down: ✅\n\n"
-
-                                  "🔴 SELL CONFIRMED\n"
-
-                                  f"Time: "
-                                  f"{datetime.now().strftime('%H:%M:%S')}"
-                              )
-
-
-                              print(
-                                  "\n"
-                                  + "=" * 60
-                              )
-
-                              print(message)
-
-                              print(
-                                  "=" * 60
-                                  + "\n"
-                              )
-
-
-                              send_telegram(
-                                  message
-                              )
-
-
-                              save_signal(
-
-                                  name,
-
-                                  token,
-
-                                  last["ask"],
-
-                                  last["bid"],
-
-                                  last["ltp"],
-
-                                  replenishment_count
-                              )
-
-
-                              reset_stock(token)
 
 
               except Exception as e:
 
                   print(
-                      "Tick processing error:",
-                      e
+                      f"⚠️ Process error "
+                      f"{token}: {e}"
                   )
 
 
           # ============================================================
-          # WEBSOCKET DATA
+          # WEBSOCKET CALLBACKS
           # ============================================================
 
           def on_data(wsapp, message):
 
               try:
 
+                  # ----------------------------------------------------
+                  # MESSAGE CAN BE DICT
+                  # ----------------------------------------------------
+
                   if isinstance(
-                      message,
-                      list
-                  ):
-
-                      for tick in message:
-
-                          process_tick(tick)
-
-
-                  elif isinstance(
                       message,
                       dict
                   ):
 
-                      process_tick(message)
+                      token = message.get(
+                          "token"
+                      )
+
+                      if token:
+
+                          process_quote(
+                              token,
+                              message
+                          )
+
+                          return
+
+
+                  # ----------------------------------------------------
+                  # MESSAGE CAN BE JSON STRING
+                  # ----------------------------------------------------
+
+                  import json
+
+                  if isinstance(
+                      message,
+                      str
+                  ):
+
+                      obj = json.loads(
+                          message
+                      )
+
+                      if isinstance(
+                          obj,
+                          dict
+                      ):
+
+                          token = obj.get(
+                              "token"
+                          )
+
+                          if token:
+
+                              process_quote(
+                                  token,
+                                  obj
+                              )
 
 
               except Exception as e:
 
                   print(
-                      "on_data error:",
+                      "⚠️ WebSocket data error:",
                       e
                   )
 
 
-          # ============================================================
-          # WEBSOCKET OPEN
-          # ============================================================
-
           def on_open(wsapp):
 
+              print()
               print(
-                  "\n"
-                  "======================================"
+                  "🟢 WebSocket connected"
               )
 
               print(
-                  "✅ ANGEL ONE WEBSOCKET CONNECTED"
+                  "📡 Subscribing 5 stocks..."
               )
 
-              print(
-                  "======================================"
-              )
+
+              token_list = [
+
+                  {
+
+                      "exchangeType": 1,
+
+                      "tokens": list(
+                          STOCKS.keys()
+                      )
+
+                  }
+
+              ]
+
 
               try:
 
-                  token_list = [
-
-                      {
-                          "exchangeType": 1,
-
-                          "tokens":
-                              list(STOCKS.keys())
-                      }
-
-                  ]
-
-
-                  # Mode 3 = Snap Quote
-
                   wsapp.subscribe(
-
                       "paul-sell-scanner",
-
                       3,
-
                       token_list
                   )
 
-
                   print(
-                      "✅ Subscribed to 5 NSE stocks"
+                      "✅ Subscription sent"
                   )
 
                   print(
-                      "Mode: 3 SNAP QUOTE"
+                      "📊 MODE 3 SNAP QUOTE"
                   )
 
+                  print(
+                      "📌 Stocks:",
+                      ", ".join(
+                          STOCKS.values()
+                      )
+                  )
+
+                  print()
 
               except Exception as e:
 
@@ -1088,14 +881,7 @@ jobs:
                   )
 
 
-          # ============================================================
-          # WEBSOCKET ERROR
-          # ============================================================
-
-          def on_error(
-              wsapp,
-              error
-          ):
+          def on_error(wsapp, error):
 
               print(
                   "❌ WebSocket error:",
@@ -1103,40 +889,37 @@ jobs:
               )
 
 
-          # ============================================================
-          # WEBSOCKET CLOSE
-          # ============================================================
+          def on_close(wsapp):
 
-          def on_close(
-              wsapp
-          ):
-
+              print()
               print(
                   "🔴 WebSocket closed"
               )
 
 
           # ============================================================
-          # STOP AT 11:00
+          # STOP THREAD
           # ============================================================
 
           def stop_at_11():
 
-              global running
+              global sws
 
-              while running:
+              while True:
 
-                  now = market_time()
+                  current = market_time()
 
 
-                  if now >= END_TIME:
+                  if current >= END_TIME:
 
+                      print()
                       print(
-                          "\n"
-                          "⏰ 11:00 IST reached."
+                          "🛑 11:00 IST reached"
                       )
 
-                      running = False
+                      print(
+                          "🛑 Stopping scanner..."
+                      )
 
 
                       try:
@@ -1148,7 +931,7 @@ jobs:
                       except Exception as e:
 
                           print(
-                              "Close error:",
+                              "⚠️ Close error:",
                               e
                           )
 
@@ -1156,101 +939,6 @@ jobs:
 
 
                   time.sleep(1)
-
-
-          # ============================================================
-          # LOGIN
-          # ============================================================
-
-          def login():
-
-              print(
-                  "🔐 Logging into Angel One..."
-              )
-
-
-              if not API_KEY:
-
-                  raise Exception(
-                      "ANGEL_API_KEY missing"
-                  )
-
-
-              if not CLIENT_ID:
-
-                  raise Exception(
-                      "ANGEL_CLIENT_ID missing"
-                  )
-
-
-              if not PASSWORD:
-
-                  raise Exception(
-                      "ANGEL_PASSWORD missing"
-                  )
-
-
-              if not TOTP_SECRET:
-
-                  raise Exception(
-                      "ANGEL_TOTP missing"
-                  )
-
-
-              obj = SmartConnect(
-                  api_key=API_KEY
-              )
-
-
-              totp = pyotp.TOTP(
-                  TOTP_SECRET
-              ).now()
-
-
-              session = obj.generateSession(
-
-                  CLIENT_ID,
-
-                  PASSWORD,
-
-                  totp
-              )
-
-
-              if not session:
-
-                  raise Exception(
-                      "Login failed"
-                  )
-
-
-              if not session.get(
-                  "data"
-              ):
-
-                  raise Exception(
-                      f"Login failed: {session}"
-                  )
-
-
-              jwt = session["data"][
-                  "jwtToken"
-              ]
-
-              feed_token = session["data"][
-                  "feedToken"
-              ]
-
-
-              print(
-                  "✅ Angel One login successful"
-              )
-
-
-              return (
-                  jwt,
-                  feed_token
-              )
 
 
           # ============================================================
@@ -1262,18 +950,13 @@ jobs:
               global sws
 
 
+              print()
+              print("=" * 70)
               print(
-                  "\n"
-                  "============================================================"
+                  "🚀 STARTING PAUL STYLE "
+                  "ORDER BOOK SELL SCANNER"
               )
-
-              print(
-                  "🚀 PAUL STYLE ORDER BOOK SELL SCANNER"
-              )
-
-              print(
-                  "============================================================"
-              )
+              print("=" * 70)
 
               print(
                   "ONLY 5 STOCKS:"
@@ -1292,142 +975,294 @@ jobs:
               )
 
               print(
-                  "ASK TARGET: approximately 3000"
+                  "ASK TARGET:",
+                  ASK_TARGET
               )
 
               print(
-                  "ASK TOLERANCE: ±150"
+                  "ASK TOLERANCE:",
+                  f"±{ASK_TOLERANCE}"
               )
 
               print(
-                  "WATCH → CONFIRM → SELL"
+                  "MODE: 3 SNAP QUOTE"
               )
 
               print(
-                  "============================================================"
+                  "FLOW: WATCH → CONFIRM → SELL"
               )
 
+              print()
 
-              # ==================================================
-              # WAIT FOR 09:15
-              # ==================================================
 
-              while (
-                  datetime.now().time()
-                  < START_TIME
-              ):
+              # ========================================================
+              # TIME DEBUG
+              # ========================================================
 
-                  print(
-                      "Waiting for 09:15 IST..."
+              print(
+                  "UTC NOW :",
+                  datetime.now(
+                      timezone.utc
+                  ).strftime(
+                      "%Y-%m-%d %H:%M:%S"
                   )
+              )
 
-                  time.sleep(10)
+              print(
+                  "IST NOW :",
+                  now_ist().strftime(
+                      "%Y-%m-%d %H:%M:%S"
+                  )
+              )
+
+              print()
 
 
-              if (
-                  datetime.now().time()
-                  >= END_TIME
-              ):
+              # ========================================================
+              # CHECK CREDENTIALS
+              # ========================================================
+
+              if not API_KEY:
 
                   print(
-                      "Market scanner time finished."
+                      "❌ ANGEL_API_KEY missing"
                   )
 
                   return
 
 
-              # ==================================================
-              # LOGIN
-              # ==================================================
+              if not CLIENT_ID:
+
+                  print(
+                      "❌ ANGEL_CLIENT_ID missing"
+                  )
+
+                  return
+
+
+              if not PASSWORD:
+
+                  print(
+                      "❌ ANGEL_PASSWORD missing"
+                  )
+
+                  return
+
+
+              if not TOTP_SECRET:
+
+                  print(
+                      "❌ ANGEL_TOTP missing"
+                  )
+
+                  return
+
+
+              if not TELE_TOKEN:
+
+                  print(
+                      "⚠️ TELE_TOKEN missing"
+                  )
+
+              if not TELE_CHAT_ID:
+
+                  print(
+                      "⚠️ TELE_CHAT_ID missing"
+                  )
+
+
+              # ========================================================
+              # WAIT FOR MARKET OPEN
+              # ========================================================
+
+              while market_time() < START_TIME:
+
+                  current = now_ist().strftime(
+                      "%H:%M:%S"
+                  )
+
+                  print(
+                      f"⏳ Waiting for 09:15 IST... "
+                      f"Current IST: {current}"
+                  )
+
+                  time.sleep(5)
+
+
+              # ========================================================
+              # IF ALREADY AFTER 11:00
+              # ========================================================
+
+              if market_time() >= END_TIME:
+
+                  print(
+                      "🛑 Market scanner time already finished."
+                  )
+
+                  return
+
+
+              print()
+              print(
+                  "🟢 MARKET WINDOW OPEN"
+              )
+
+              print(
+                  "⏰ Current IST:",
+                  now_ist().strftime(
+                      "%H:%M:%S"
+                  )
+              )
+
+              print()
+
+
+              # ========================================================
+              # ANGEL LOGIN
+              # ========================================================
+
+              print(
+                  "🔐 Logging into Angel One..."
+              )
+
 
               try:
 
-                  jwt, feed_token = login()
+                  smart_api = SmartConnect(
+                      api_key=API_KEY
+                  )
+
+
+                  totp = pyotp.TOTP(
+                      TOTP_SECRET
+                  ).now()
+
+
+                  session = smart_api.generateSession(
+                      CLIENT_ID,
+                      PASSWORD,
+                      totp
+                  )
+
+
+                  if not session:
+
+                      print(
+                          "❌ Angel login failed"
+                      )
+
+                      return
+
+
+                  auth_token = session[
+                      "data"
+                  ][
+                      "jwtToken"
+                  ]
+
+
+                  feed_token = smart_api.getfeedToken()
+
+
+                  print(
+                      "✅ Angel login SUCCESS"
+                  )
+
+                  print()
+
 
               except Exception as e:
 
                   print(
-                      "❌ LOGIN ERROR:",
+                      "❌ Angel login error:",
                       e
-                  )
-
-                  send_telegram(
-                      "🚨 PAUL SELL SCANNER\n"
-                      "Angel One LOGIN FAILED\n\n"
-                      f"Error: {e}"
                   )
 
                   return
 
 
-              # ==================================================
-              # WEBSOCKET
-              # ==================================================
-
-              sws = SmartWebSocketV2(
-
-                  jwt,
-
-                  API_KEY,
-
-                  CLIENT_ID,
-
-                  feed_token
-              )
-
-
-              sws.on_data = on_data
-
-              sws.on_open = on_open
-
-              sws.on_error = on_error
-
-              sws.on_close = on_close
-
-
-              # ==================================================
-              # STOP THREAD
-              # ==================================================
-
-              threading.Thread(
-
-                  target=stop_at_11,
-
-                  daemon=True
-
-              ).start()
-
-
-              print(
-                  "\n🚀 Scanner started."
-              )
-
-              print(
-                  "Watching 5 stocks..."
-              )
-
-
-              # ==================================================
-              # TELEGRAM START TEST
-              # ==================================================
+              # ========================================================
+              # TELEGRAM TEST
+              # ========================================================
 
               send_telegram(
 
-                  "🟢 PAUL ORDER BOOK SELL SCANNER\n\n"
-                  "Scanner started successfully.\n\n"
-                  "Stocks: RELIANCE, HDFCBANK, INFY, SBIN, ICICIBANK\n"
-                  "Time: 09:15–11:00 IST\n"
-                  "Mode: WATCH → CONFIRM → SELL"
+                  "🟢 PAUL STYLE SELL SCANNER STARTED\n\n"
+
+                  "📊 Stocks: "
+                  + ", ".join(
+                      STOCKS.values()
+                  )
+                  + "\n"
+
+                  "⏰ Time: 09:15 → 11:00 IST\n"
+
+                  "📡 Mode: 3 SNAP QUOTE\n"
+
+                  "🔴 Strategy: "
+                  "WATCH → CONFIRM → SELL\n\n"
+
+                  "Current IST: "
+                  + now_ist().strftime(
+                      "%H:%M:%S"
+                  )
+
               )
 
 
-              # ==================================================
-              # CONNECT
-              # ==================================================
+              # ========================================================
+              # STOP THREAD
+              # ========================================================
+
+              stopper = threading.Thread(
+                  target=stop_at_11,
+                  daemon=True
+              )
+
+              stopper.start()
+
+
+              # ========================================================
+              # WEBSOCKET
+              # ========================================================
 
               try:
 
+                  sws = SmartWebSocketV2(
+
+                      auth_token,
+
+                      API_KEY,
+
+                      CLIENT_ID,
+
+                      feed_token
+
+                  )
+
+
+                  sws.on_data = on_data
+                  sws.on_open = on_open
+                  sws.on_error = on_error
+                  sws.on_close = on_close
+
+
+                  print(
+                      "🚀 Connecting WebSocket..."
+                  )
+
+                  print()
+
+
                   sws.connect()
+
+
+              except KeyboardInterrupt:
+
+                  print(
+                      "🛑 Scanner stopped by user"
+                  )
+
 
               except Exception as e:
 
@@ -1436,21 +1271,25 @@ jobs:
                       e
                   )
 
-                  send_telegram(
 
-                      "🔴 PAUL SELL SCANNER\n"
-                      "WebSocket connection failed.\n\n"
-                      f"Error: {e}"
+              finally:
+
+                  print()
+                  print("=" * 70)
+                  print(
+                      "🛑 SCANNER FINISHED"
                   )
-
-
-              print(
-                  "\nScanner stopped."
-              )
+                  print(
+                      "FINAL IST TIME:",
+                      now_ist().strftime(
+                          "%H:%M:%S"
+                      )
+                  )
+                  print("=" * 70)
 
 
           # ============================================================
-          # START
+          # RUN
           # ============================================================
 
           if __name__ == "__main__":
@@ -1461,10 +1300,9 @@ jobs:
 
 
       # ============================================================
-      # RUN
+      # RUN SCANNER
       # ============================================================
-
-      - name: Run scanner
+      - name: Run Scanner
         env:
           ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
           ANGEL_CLIENT_ID: ${{ secrets.ANGEL_CLIENT_ID }}
@@ -1476,18 +1314,25 @@ jobs:
 
         run: |
 
-          echo "============================================================"
-          echo "🚀 STARTING PAUL STYLE ORDER BOOK SELL SCANNER"
-          echo "============================================================"
+          echo "=============================================="
+          echo "🚀 PAUL STYLE SELL SCANNER"
+          echo "=============================================="
+
+          echo "GitHub Runner UTC:"
+          date -u
+
+          echo "System local time:"
+          date
+
+          echo "Starting Python scanner..."
 
           python scanner.py
 
 
       # ============================================================
-      # SAVE CSV
+      # UPLOAD SIGNAL CSV
       # ============================================================
-
-      - name: Upload signals
+      - name: Upload Signal CSV
         if: always()
         uses: actions/upload-artifact@v4
         with:
