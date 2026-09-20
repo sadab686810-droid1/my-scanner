@@ -7,7 +7,6 @@ on:
 
   workflow_dispatch:
 
-
 jobs:
 
   scan:
@@ -18,44 +17,41 @@ jobs:
 
     steps:
 
-      # ============================================================
-      # CHECKOUT
-      # ============================================================
-
+      # ==========================================================
+      # 1. CHECKOUT
+      # ==========================================================
       - name: Checkout Repository
         uses: actions/checkout@v4
 
 
-      # ============================================================
-      # PYTHON
-      # ============================================================
-
+      # ==========================================================
+      # 2. SETUP PYTHON
+      # ==========================================================
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.10'
 
 
-      # ============================================================
-      # INSTALL PACKAGES
-      # ============================================================
-
-      - name: Install Packages
+      # ==========================================================
+      # 3. INSTALL PACKAGES
+      # ==========================================================
+      - name: Install Python Packages
         run: |
-
           python -m pip install --upgrade pip
 
-          python -m pip install smartapi-python
-          python -m pip install websocket-client
-          python -m pip install pyotp
-          python -m pip install requests
-          python -m pip install logzero
+          pip install smartapi-python
+          pip install websocket-client
+          pip install pyotp
+          pip install requests
+          pip install logzero
 
-          echo "=============================================="
-          echo "VERIFY PACKAGES"
-          echo "=============================================="
 
-          python -m pip show logzero
+      # ==========================================================
+      # 4. VERIFY PACKAGES
+      # ==========================================================
+      - name: Verify Python Packages
+        run: |
 
           python -c "import logzero; print('LOGZERO OK')"
 
@@ -63,2881 +59,2695 @@ jobs:
 
           python -c "from SmartApi.smartWebSocketV2 import SmartWebSocketV2; print('SMARTWEBSOCKETV2 OK')"
 
-          echo "=============================================="
 
-
-      # ============================================================
-      # RESTORE VOLUME HISTORY
-      # ============================================================
-
+      # ==========================================================
+      # 5. RESTORE 20-DAY VOLUME HISTORY
+      # ==========================================================
       - name: Restore Volume History
         uses: actions/cache/restore@v4
         with:
-
           path: data
-
           key: futures-volume-history-${{ github.run_id }}-${{ github.run_attempt }}
-
           restore-keys: |
             futures-volume-history-
 
 
-      # ============================================================
-      # CREATE DATA DIRECTORY
-      # ============================================================
-
-      - name: Prepare Data Directory
+      # ==========================================================
+      # 6. PREPARE DATA FOLDER
+      # ==========================================================
+      - name: Prepare Data Folder
         run: |
-
           mkdir -p data
 
-          echo "=============================================="
-          echo "DATA DIRECTORY"
-          echo "=============================================="
+          if [ ! -f data/volume_history.json ]; then
+            echo '{}' > data/volume_history.json
+          fi
 
-          ls -la data || true
+          echo "=========================================="
+          echo "DATA FOLDER"
+          echo "=========================================="
+
+          ls -lah data
 
 
-      # ============================================================
-      # CREATE SCANNER
-      # ============================================================
-
+      # ==========================================================
+      # 7. CREATE SCANNER.PY
+      # ==========================================================
       - name: Create Scanner
         run: |
-
           cat > scanner.py <<'PYTHON'
 
-import os
-import csv
-import json
-import math
-import time
-import threading
-import requests
-import pyotp
+          import os
+          import csv
+          import json
+          import time
+          import threading
+          from datetime import datetime, timedelta
+          from zoneinfo import ZoneInfo
 
-from datetime import datetime, time as dt_time, timezone
-from zoneinfo import ZoneInfo
+          import requests
+          import pyotp
 
-from SmartApi import SmartConnect
-from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+          from SmartApi import SmartConnect
+          from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
 
-# ============================================================
-# TIMEZONE
-# ============================================================
+          # ==========================================================
+          # CONFIG
+          # ==========================================================
 
-IST = ZoneInfo("Asia/Kolkata")
+          IST = ZoneInfo("Asia/Kolkata")
 
+          MARKET_START = "09:15"
+          MARKET_END = "15:00"
 
-def now_ist():
-    return datetime.now(IST)
+          MIN_PRICE_CHANGE = 1.5
+          MIN_OI_CHANGE = 2.0
 
+          MIN_CURRENT_OI = 30_000_000
 
-def market_time():
-    return now_ist().time()
+          MIN_BID_ASK_RATIO = 1.8
 
+          HISTORY_DAYS = 20
 
-# ============================================================
-# CREDENTIALS
-# ============================================================
+          HISTORY_FILE = "data/volume_history.json"
 
-API_KEY = os.getenv("ANGEL_API_KEY")
-CLIENT_ID = os.getenv("ANGEL_CLIENT_ID")
-PASSWORD = os.getenv("ANGEL_PASSWORD")
-TOTP_SECRET = os.getenv("ANGEL_TOTP")
+          SIGNAL_FILE = "futures_buy_signals.csv"
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+          MASTER_URL = (
+              "https://margincalculator.angelone.in/"
+              "OpenAPI_File/files/OpenAPIScripMaster.json"
+          )
 
 
-# ============================================================
-# MARKET TIME
-# ============================================================
+          # ==========================================================
+          # ANGEL ONE CREDENTIALS
+          # ==========================================================
 
-START_TIME = dt_time(9, 15, 0)
-END_TIME = dt_time(15, 0, 0)
+          ANGEL_API_KEY = os.getenv("ANGEL_API_KEY", "")
+          ANGEL_CLIENT_ID = os.getenv("ANGEL_CLIENT_ID", "")
+          ANGEL_PASSWORD = os.getenv("ANGEL_PASSWORD", "")
+          ANGEL_TOTP = os.getenv("ANGEL_TOTP", "")
 
+          TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+          TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# ============================================================
-# CONDITIONS
-# ============================================================
 
-FUTURES_PRICE_CHANGE_MIN = 1.5
-FUTURES_OI_CHANGE_MIN = 2.0
-FUTURES_MIN_OI = 30_000_000
+          # ==========================================================
+          # GLOBALS
+          # ==========================================================
 
-OPTION_BUY_SELL_RATIO = 1.8
+          smart_api = None
+          sws = None
 
-MIN_GREEN_CANDLES = 2
+          MASTER = []
 
-VOLUME_MULTIPLIER = 1.0
+          FUTURES = {}
+          OPTIONS = {}
+          SPOTS = {}
 
-REQUIRED_HISTORY_DAYS = 20
+          NIFTY_FUTURE = None
 
+          WATCHLIST = []
 
-# ============================================================
-# NIFTY
-# ============================================================
+          LIVE = {}
 
-NIFTY_NAME = "NIFTY"
+          CANDLES = {}
 
+          HISTORY = {}
 
-# ============================================================
-# FILES
-# ============================================================
+          LAST_SIGNAL = {}
 
-HISTORY_FILE = "data/volume_history.json"
+          SUBSCRIBED_OPTION_TOKENS = set()
 
-SIGNAL_FILE = "futures_buy_signals.csv"
+          WS_READY = False
 
+          LOCK = threading.Lock()
 
-# ============================================================
-# GLOBALS
-# ============================================================
 
-smart_api = None
-sws = None
+          # ==========================================================
+          # TIME HELPERS
+          # ==========================================================
 
-MASTER = []
+          def now_ist():
+              return datetime.now(IST)
 
-FUTURES = {}
-OPTIONS = {}
-SPOTS = {}
 
-NIFTY_FUTURE = None
+          def today_string():
+              return now_ist().strftime("%Y-%m-%d")
 
-WATCHLIST = {}
-LIVE = {}
-CANDLES = {}
 
-LAST_SIGNAL = {}
+          def current_time_string():
+              return now_ist().strftime("%H:%M:%S")
 
-SUBSCRIBED_OPTION_TOKENS = set()
 
-LOCK = threading.Lock()
+          def market_time_ok():
 
+              t = now_ist().strftime("%H:%M")
 
-# ============================================================
-# SAFE FLOAT
-# ============================================================
+              return MARKET_START <= t <= MARKET_END
 
-def safe_float(value, default=0.0):
 
-    try:
+          # ==========================================================
+          # TELEGRAM
+          # ==========================================================
 
-        return float(value)
+          def send_telegram(message):
 
-    except Exception:
+              if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+                  print("Telegram credentials not configured.")
+                  return False
 
-        return default
+              try:
 
+                  url = (
+                      "https://api.telegram.org/bot"
+                      f"{TELEGRAM_BOT_TOKEN}/sendMessage"
+                  )
 
-# ============================================================
-# TELEGRAM
-# ============================================================
+                  payload = {
+                      "chat_id": TELEGRAM_CHAT_ID,
+                      "text": message
+                  }
 
-def send_telegram(message):
+                  response = requests.post(
+                      url,
+                      json=payload,
+                      timeout=15
+                  )
 
-    if not TELEGRAM_BOT_TOKEN:
+                  if response.status_code == 200:
+                      print("Telegram sent.")
+                      return True
 
-        print("TELEGRAM_BOT_TOKEN missing")
+                  print(
+                      "Telegram failed:",
+                      response.status_code,
+                      response.text
+                  )
 
-        return
+                  return False
 
-    if not TELEGRAM_CHAT_ID:
+              except Exception as e:
 
-        print("TELEGRAM_CHAT_ID missing")
+                  print("Telegram error:", e)
 
-        return
+                  return False
 
-    url = (
-        "https://api.telegram.org/bot"
-        + TELEGRAM_BOT_TOKEN
-        + "/sendMessage"
-    )
 
-    try:
+          # ==========================================================
+          # LOAD VOLUME HISTORY
+          # ==========================================================
 
-        r = requests.post(
-            url,
-            data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message
-            },
-            timeout=10
-        )
+          def load_history():
 
-        if r.ok:
+              global HISTORY
 
-            print("Telegram sent")
+              try:
 
-        else:
+                  if os.path.exists(HISTORY_FILE):
 
-            print(
-                "Telegram error:",
-                r.status_code,
-                r.text
-            )
+                      with open(
+                          HISTORY_FILE,
+                          "r",
+                          encoding="utf-8"
+                      ) as f:
 
-    except Exception as e:
+                          HISTORY = json.load(f)
 
-        print(
-            "Telegram exception:",
-            e
-        )
+                      print(
+                          "Volume history loaded:",
+                          len(HISTORY),
+                          "stocks"
+                      )
 
+                  else:
 
-# ============================================================
-# LOAD HISTORY
-# ============================================================
+                      HISTORY = {}
 
-def load_history():
+              except Exception as e:
 
-    if not os.path.exists(HISTORY_FILE):
+                  print("History load error:", e)
 
-        return {}
+                  HISTORY = {}
 
-    try:
 
-        with open(
-            HISTORY_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
+          # ==========================================================
+          # SAVE VOLUME HISTORY
+          # ==========================================================
 
-            return json.load(f)
+          def save_history():
 
-    except Exception as e:
+              try:
 
-        print(
-            "History load error:",
-            e
-        )
+                  os.makedirs(
+                      os.path.dirname(HISTORY_FILE),
+                      exist_ok=True
+                  )
 
-        return {}
+                  with open(
+                      HISTORY_FILE,
+                      "w",
+                      encoding="utf-8"
+                  ) as f:
 
+                      json.dump(
+                          HISTORY,
+                          f,
+                          indent=2
+                      )
 
-HISTORY = load_history()
+                  print("Volume history saved.")
 
+              except Exception as e:
 
-# ============================================================
-# SAVE HISTORY
-# ============================================================
+                  print("History save error:", e)
 
-def save_history():
 
-    os.makedirs(
-        "data",
-        exist_ok=True
-    )
+          # ==========================================================
+          # DOWNLOAD SCRIP MASTER
+          # ==========================================================
 
-    with open(
-        HISTORY_FILE,
-        "w",
-        encoding="utf-8"
-    ) as f:
+          def download_master():
 
-        json.dump(
-            HISTORY,
-            f,
-            separators=(",", ":")
-        )
+              global MASTER
 
+              print("")
+              print("=" * 70)
+              print("DOWNLOADING ANGEL ONE SCRIP MASTER")
+              print("=" * 70)
 
-# ============================================================
-# DOWNLOAD SCRIP MASTER
-# ============================================================
+              try:
 
-def download_master():
+                  response = requests.get(
+                      MASTER_URL,
+                      timeout=60
+                  )
 
-    url = (
-        "https://margincalculator.angelone.in/"
-        "OpenAPI_File/files/"
-        "OpenAPIScripMaster.json"
-    )
+                  response.raise_for_status()
 
-    print(
-        "Downloading Angel One Scrip Master..."
-    )
+                  MASTER = response.json()
 
-    last_error = None
+                  print(
+                      "TOTAL SCRIP MASTER:",
+                      len(MASTER)
+                  )
 
-    for attempt in range(1, 4):
+                  return True
 
-        try:
+              except Exception as e:
 
-            print(
-                f"Master download attempt {attempt}/3"
-            )
+                  print(
+                      "Scrip master error:",
+                      e
+                  )
 
-            r = requests.get(
-                url,
-                timeout=120
-            )
+                  return False
 
-            r.raise_for_status()
 
-            data = r.json()
+          # ==========================================================
+          # DATE PARSER
+          # ==========================================================
 
-            if not isinstance(data, list):
+          def parse_expiry(value):
 
-                raise ValueError(
-                    "Scrip master is not a list"
-                )
+              if not value:
+                  return None
 
-            if len(data) < 10000:
+              value = str(value).strip()
 
-                raise ValueError(
-                    f"Scrip master too small: {len(data)}"
-                )
+              formats = [
+                  "%d%b%Y",
+                  "%d%b%y",
+                  "%Y-%m-%d"
+              ]
 
-            print(
-                "Scrip Master loaded:",
-                len(data)
-            )
+              for fmt in formats:
 
-            return data
+                  try:
 
-        except Exception as e:
+                      return datetime.strptime(
+                          value.upper(),
+                          fmt
+                      ).date()
 
-            last_error = e
+                  except Exception:
+                      pass
 
-            print(
-                "Master download error:",
-                e
-            )
+              return None
 
-            if attempt < 3:
 
-                time.sleep(5)
+          # ==========================================================
+          # BUILD CONTRACTS
+          # ==========================================================
 
-    raise RuntimeError(
-        f"Scrip master download failed: {last_error}"
-    )
+          def build_contracts():
 
+              global FUTURES
+              global OPTIONS
+              global SPOTS
+              global NIFTY_FUTURE
 
-# ============================================================
-# EXPIRY
-# ============================================================
+              FUTURES = {}
+              OPTIONS = {}
+              SPOTS = {}
+              NIFTY_FUTURE = None
 
-def expiry_value(value):
+              today = now_ist().date()
 
-    if not value:
+              futures_temp = {}
+              options_temp = {}
 
-        return None
+              print("")
+              print("=" * 70)
+              print("BUILDING CONTRACT LIST")
+              print("=" * 70)
 
-    try:
+              for row in MASTER:
 
-        return datetime.strptime(
-            str(value),
-            "%d%b%Y"
-        ).date()
+                  try:
 
-    except Exception:
+                      exch = str(
+                          row.get("exch_seg", "")
+                      ).lower()
 
-        try:
+                      symbol = str(
+                          row.get("symbol", "")
+                      ).upper()
 
-            return datetime.strptime(
-                str(value),
-                "%Y-%m-%d"
-            ).date()
+                      name = str(
+                          row.get("name", "")
+                      ).upper()
 
-        except Exception:
+                      token = str(
+                          row.get("token", "")
+                      )
 
-            return None
+                      expiry = parse_expiry(
+                          row.get("expiry", "")
+                      )
 
+                      if exch in ("nse", "nse_cm"):
 
-# ============================================================
-# STRIKE
-# ============================================================
+                          if symbol.endswith("-EQ"):
 
-def strike_value(value):
+                              base_name = symbol[:-3]
 
-    try:
+                              SPOTS[base_name] = {
+                                  "token": token,
+                                  "symbol": symbol,
+                                  "name": base_name
+                              }
 
-        return float(value)
 
-    except Exception:
+                      if exch != "nfo":
+                          continue
 
-        return 0.0
+                      instrument = str(
+                          row.get("instrumenttype", "")
+                      ).upper()
 
+                      if expiry is None:
+                          continue
 
-# ============================================================
-# BUILD CONTRACTS
-# ============================================================
+                      if expiry < today:
+                          continue
 
-def build_contracts():
 
-    global FUTURES
-    global OPTIONS
-    global SPOTS
-    global NIFTY_FUTURE
+                      # ------------------------------------------------
+                      # STOCK FUTURES
+                      # ------------------------------------------------
 
-    today = now_ist().date()
+                      if instrument == "FUTSTK":
 
-    FUTURES = {}
-    OPTIONS = {}
-    SPOTS = {}
+                          if name not in futures_temp:
 
-    NIFTY_FUTURE = None
+                              futures_temp[name] = []
 
-    for row in MASTER:
+                          futures_temp[name].append({
+                              "token": token,
+                              "symbol": symbol,
+                              "name": name,
+                              "expiry": expiry
+                          })
 
-        exch = str(
-            row.get(
-                "exch_seg",
-                ""
-            )
-        ).lower()
 
-        symbol = str(
-            row.get(
-                "symbol",
-                ""
-            )
-        )
+                      # ------------------------------------------------
+                      # NIFTY FUTURES
+                      # ------------------------------------------------
 
-        name = str(
-            row.get(
-                "name",
-                ""
-            )
-        )
+                      elif instrument == "FUTIDX":
 
-        token = str(
-            row.get(
-                "token",
-                ""
-            )
-        )
+                          if name == "NIFTY":
 
-        instrument = str(
-            row.get(
-                "instrumenttype",
-                ""
-            )
-        )
+                              if NIFTY_FUTURE is None:
 
-        expiry = expiry_value(
-            row.get("expiry")
-        )
+                                  NIFTY_FUTURE = {
+                                      "token": token,
+                                      "symbol": symbol,
+                                      "name": name,
+                                      "expiry": expiry
+                                  }
 
+                              else:
 
-        # ========================================================
-        # NSE EQUITY
-        # ========================================================
+                                  if expiry < NIFTY_FUTURE["expiry"]:
 
-        if (
-            exch in ("nse", "nse_cm")
-            and symbol.endswith("-EQ")
-        ):
+                                      NIFTY_FUTURE = {
+                                          "token": token,
+                                          "symbol": symbol,
+                                          "name": name,
+                                          "expiry": expiry
+                                      }
 
-            SPOTS[name] = {
-                "token": token,
-                "symbol": symbol
-            }
 
+                      # ------------------------------------------------
+                      # STOCK CE OPTIONS
+                      # ------------------------------------------------
 
-        # ========================================================
-        # STOCK FUTURES
-        # ========================================================
+                      elif instrument == "OPTSTK":
 
-        if (
-            exch == "nfo"
-            and instrument == "FUTSTK"
-            and expiry
-            and expiry >= today
-        ):
+                          option_type = str(
+                              row.get("optiontype", "")
+                          ).upper()
 
-            FUTURES.setdefault(
-                name,
-                []
-            ).append({
+                          if option_type != "CE":
+                              continue
 
-                "token": token,
-                "symbol": symbol,
-                "expiry": expiry,
-                "lotsize": row.get(
-                    "lotsize",
-                    ""
-                )
+                          strike_raw = row.get(
+                              "strike",
+                              0
+                          )
 
-            })
+                          try:
 
+                              strike = (
+                                  float(strike_raw) / 100
+                              )
 
-        # ========================================================
-        # NIFTY FUTURE
-        # ========================================================
+                          except Exception:
 
-        if (
-            exch == "nfo"
-            and instrument == "FUTIDX"
-            and name.upper() == NIFTY_NAME
-            and expiry
-            and expiry >= today
-        ):
+                              continue
 
-            if NIFTY_FUTURE is None:
+                          if name not in options_temp:
 
-                NIFTY_FUTURE = {
-                    "token": token,
-                    "symbol": symbol,
-                    "expiry": expiry
-                }
+                              options_temp[name] = []
 
-            elif expiry < NIFTY_FUTURE["expiry"]:
+                          options_temp[name].append({
+                              "token": token,
+                              "symbol": symbol,
+                              "name": name,
+                              "expiry": expiry,
+                              "strike": strike,
+                              "option_type": "CE"
+                          })
 
-                NIFTY_FUTURE = {
-                    "token": token,
-                    "symbol": symbol,
-                    "expiry": expiry
-                }
 
+              # ========================================================
+              # SELECT NEAREST STOCK FUTURE
+              # ========================================================
 
-        # ========================================================
-        # STOCK OPTIONS
-        # ========================================================
+              for name, rows in futures_temp.items():
 
-        if (
-            exch == "nfo"
-            and instrument == "OPTSTK"
-            and expiry
-            and expiry >= today
-        ):
+                  rows = sorted(
+                      rows,
+                      key=lambda x: x["expiry"]
+                  )
 
-            upper_symbol = symbol.upper()
+                  if rows:
 
-            if upper_symbol.endswith("CE"):
+                      FUTURES[name] = rows[0]
 
-                option_type = "CE"
 
-            elif upper_symbol.endswith("PE"):
+              # ========================================================
+              # STORE OPTIONS
+              # ========================================================
 
-                option_type = "PE"
+              for name, rows in options_temp.items():
 
-            else:
+                  rows = sorted(
+                      rows,
+                      key=lambda x: (
+                          x["expiry"],
+                          x["strike"]
+                      )
+                  )
 
-                option_type = ""
+                  OPTIONS[name] = rows
 
 
-            if option_type:
+              print(
+                  "NSE SPOT STOCKS:",
+                  len(SPOTS)
+              )
 
-                OPTIONS.setdefault(
-                    name,
-                    []
-                ).append({
+              print(
+                  "STOCK FUTURES:",
+                  len(FUTURES)
+              )
 
-                    "token": token,
-                    "symbol": symbol,
-                    "expiry": expiry,
+              print(
+                  "STOCK OPTION CHAINS:",
+                  len(OPTIONS)
+              )
 
-                    "strike":
-                        strike_value(
-                            row.get("strike")
-                        ) / 100,
+              if NIFTY_FUTURE:
 
-                    "type":
-                        option_type
+                  print(
+                      "NIFTY FUTURE:",
+                      NIFTY_FUTURE["symbol"],
+                      NIFTY_FUTURE["expiry"]
+                  )
 
-                })
+              else:
 
+                  print("NIFTY FUTURE NOT FOUND")
 
-    # ========================================================
-    # NEAREST STOCK FUTURE
-    # ========================================================
 
-    for name in list(FUTURES.keys()):
+          # ==========================================================
+          # FIND ATM CE
+          # ==========================================================
 
-        contracts = FUTURES[name]
+          def find_atm_ce(
+              name,
+              spot_price
+          ):
 
-        contracts.sort(
-            key=lambda x: x["expiry"]
-        )
+              rows = OPTIONS.get(
+                  name,
+                  []
+              )
 
-        FUTURES[name] = contracts[:1]
+              if not rows:
+                  return None
 
+              nearest_expiry = min(
+                  row["expiry"]
+                  for row in rows
+              )
 
-    # ========================================================
-    # SORT OPTIONS
-    # ========================================================
+              same_expiry = [
+                  row
+                  for row in rows
+                  if row["expiry"] == nearest_expiry
+              ]
 
-    for name in list(OPTIONS.keys()):
+              if not same_expiry:
+                  return None
 
-        OPTIONS[name].sort(
-            key=lambda x: (
-                x["expiry"],
-                x["strike"]
-            )
-        )
+              atm = min(
+                  same_expiry,
+                  key=lambda row:
+                  abs(
+                      row["strike"] -
+                      spot_price
+                  )
+              )
 
+              return atm
 
-    print()
 
-    print(
-        "Spot symbols:",
-        len(SPOTS)
-    )
+          # ==========================================================
+          # PRICE CHANGE
+          # ==========================================================
 
-    print(
-        "Futures symbols:",
-        len(FUTURES)
-    )
+          def price_change(item):
 
-    print(
-        "Options symbols:",
-        len(OPTIONS)
-    )
+              ltp = item.get(
+                  "ltp"
+              )
 
+              close = item.get(
+                  "close"
+              )
 
-    if NIFTY_FUTURE:
+              if ltp is None or close is None:
+                  return None
 
-        print(
-            "NIFTY FUTURE:",
-            NIFTY_FUTURE["symbol"],
-            NIFTY_FUTURE["token"]
-        )
+              if close <= 0:
+                  return None
 
-    else:
+              return (
+                  (ltp - close)
+                  / close
+                  * 100
+              )
 
-        print(
-            "NIFTY FUTURE NOT FOUND"
-        )
 
+          # ==========================================================
+          # OI CHANGE
+          # ==========================================================
 
-# ============================================================
-# FIND ATM CE
-# ============================================================
+          def oi_change_percent(item):
 
-def find_atm_ce(
-    name,
-    spot_price
-):
+              value = item.get(
+                  "oi_change_percent"
+              )
 
-    contracts = OPTIONS.get(
-        name,
-        []
-    )
+              if value is not None:
 
-    if not contracts:
+                  try:
 
-        return None
+                      return float(value)
 
-    today = now_ist().date()
+                  except Exception:
+                      pass
 
-    valid = [
 
-        x
+              opening_oi = item.get(
+                  "opening_oi"
+              )
 
-        for x in contracts
+              oi = item.get(
+                  "oi"
+              )
 
-        if (
-            x["expiry"] >= today
-            and
-            x["type"] == "CE"
-        )
+              if (
+                  opening_oi is None
+                  or oi is None
+                  or opening_oi <= 0
+              ):
 
-    ]
+                  return None
 
-    if not valid:
+              return (
+                  (oi - opening_oi)
+                  / opening_oi
+                  * 100
+              )
 
-        return None
 
-    nearest_expiry = min(
-        x["expiry"]
-        for x in valid
-    )
+          # ==========================================================
+          # BEST BUY
+          # ==========================================================
 
-    valid = [
+          def best_buy(item):
 
-        x
+              levels = item.get(
+                  "best_5_buy_data",
+                  []
+              )
 
-        for x in valid
+              if not levels:
+                  return 0, 0
 
-        if x["expiry"] == nearest_expiry
+              try:
 
-    ]
+                  qty = float(
+                      levels[0].get(
+                          "quantity",
+                          0
+                      )
+                  )
 
-    return min(
+                  price = float(
+                      levels[0].get(
+                          "price",
+                          0
+                      )
+                  ) / 100
 
-        valid,
+                  return qty, price
 
-        key=lambda x:
-        abs(
-            x["strike"]
-            - spot_price
-        )
+              except Exception:
 
-    )
+                  return 0, 0
 
 
-# ============================================================
-# PRICE CHANGE
-# ============================================================
+          # ==========================================================
+          # BEST SELL
+          # ==========================================================
 
-def price_change(item):
+          def best_sell(item):
 
-    ltp = item.get(
-        "ltp",
-        0
-    )
+              levels = item.get(
+                  "best_5_sell_data",
+                  []
+              )
 
-    close = item.get(
-        "close",
-        0
-    )
+              if not levels:
+                  return 0, 0
 
-    if close <= 0:
+              try:
 
-        return None
+                  qty = float(
+                      levels[0].get(
+                          "quantity",
+                          0
+                      )
+                  )
 
-    return (
-        (ltp - close)
-        / close
-    ) * 100
+                  price = float(
+                      levels[0].get(
+                          "price",
+                          0
+                      )
+                  ) / 100
 
+                  return qty, price
 
-# ============================================================
-# OI CHANGE
-# ============================================================
+              except Exception:
 
-def oi_change_percent(item):
+                  return 0, 0
 
-    current_oi = item.get(
-        "oi",
-        0
-    )
 
-    api_change = item.get(
-        "oi_change_percent",
-        None
-    )
+          # ==========================================================
+          # PARSE WEBSOCKET TICK
+          # ==========================================================
 
-    if (
-        api_change is not None
-        and math.isfinite(api_change)
-        and abs(api_change) < 1000
-    ):
+          def process_tick(message):
 
-        return api_change
+              try:
 
+                  token = str(
+                      message.get(
+                          "token",
+                          ""
+                      )
+                  )
 
-    opening_oi = item.get(
-        "opening_oi"
-    )
+                  if not token:
+                      return
 
-    if (
-        opening_oi
-        and opening_oi > 0
-    ):
+                  ltp_raw = message.get(
+                      "last_traded_price"
+                  )
 
-        return (
-            (current_oi - opening_oi)
-            / opening_oi
-        ) * 100
+                  if ltp_raw is None:
+                      return
 
-    return None
+                  ltp = float(
+                      ltp_raw
+                  ) / 100
 
+                  volume_raw = message.get(
+                      "volume_trade_for_the_day"
+                  )
 
-# ============================================================
-# DEPTH
-# ============================================================
+                  volume = (
+                      float(volume_raw)
+                      if volume_raw is not None
+                      else None
+                  )
 
-def best_buy(item):
+                  oi_raw = message.get(
+                      "open_interest"
+                  )
 
-    arr = item.get(
-        "best_5_buy_data",
-        []
-    )
+                  oi = (
+                      float(oi_raw)
+                      if oi_raw is not None
+                      else None
+                  )
 
-    if not arr:
+                  close_raw = message.get(
+                      "closed_price"
+                  )
 
-        return 0, 0
+                  close = (
+                      float(close_raw) / 100
+                      if close_raw is not None
+                      else None
+                  )
 
-    x = arr[0]
+                  avg_raw = message.get(
+                      "average_traded_price"
+                  )
 
-    return (
-        safe_float(
-            x.get(
-                "quantity",
-                0
-            )
-        ),
-        safe_float(
-            x.get(
-                "price",
-                0
-            )
-        ) / 100
-    )
+                  average_price = (
+                      float(avg_raw) / 100
+                      if avg_raw is not None
+                      else None
+                  )
 
+                  oi_change_raw = message.get(
+                      "open_interest_change_percentage"
+                  )
 
-def best_sell(item):
+                  oi_change = None
 
-    arr = item.get(
-        "best_5_sell_data",
-        []
-    )
+                  if oi_change_raw is not None:
 
-    if not arr:
+                      try:
 
-        return 0, 0
+                          oi_change = float(
+                              oi_change_raw
+                          )
 
-    x = arr[0]
+                      except Exception:
 
-    return (
-        safe_float(
-            x.get(
-                "quantity",
-                0
-            )
-        ),
-        safe_float(
-            x.get(
-                "price",
-                0
-            )
-        ) / 100
-    )
+                          oi_change = None
 
 
-# ============================================================
-# CANDLE BUILDER
-# ============================================================
+                  timestamp = (
+                      message.get(
+                          "exchange_timestamp"
+                      )
+                      or
+                      message.get(
+                          "last_traded_timestamp"
+                      )
+                  )
 
-def update_candle(
-    name,
-    tick
-):
+                  tick_time = now_ist()
 
-    ltp = tick.get(
-        "ltp",
-        0
-    )
+                  if timestamp is not None:
 
-    volume = tick.get(
-        "volume",
-        0
-    )
+                      try:
 
-    ts = tick.get(
-        "timestamp"
-    )
+                          ts = float(timestamp)
 
-    if not ts:
+                          if ts > 10_000_000_000:
 
-        return
+                              ts /= 1000
 
-    minute = (
-        datetime.fromtimestamp(
-            ts,
-            IST
-        )
-        .replace(
-            second=0,
-            microsecond=0
-        )
-    )
+                          tick_time = datetime.fromtimestamp(
+                              ts,
+                              tz=IST
+                          )
 
-    key = minute.strftime(
-        "%Y-%m-%d %H:%M"
-    )
+                      except Exception:
+                          pass
 
-    state = CANDLES.setdefault(
-        name,
-        {}
-    )
 
-    candle = state.get(
-        key
-    )
+                  LIVE[token] = {
 
-    if candle is None:
+                      "token": token,
 
-        candle = {
+                      "ltp": ltp,
 
-            "date":
-                minute.strftime(
-                    "%Y-%m-%d"
-                ),
+                      "volume": volume,
 
-            "slot":
-                minute.strftime(
-                    "%H:%M"
-                ),
+                      "oi": oi,
 
-            "open": ltp,
-            "high": ltp,
-            "low": ltp,
-            "close": ltp,
+                      "close": close,
 
-            "volume_start":
-                volume,
+                      "average_price": average_price,
 
-            "volume_last":
-                volume
+                      "oi_change_percent": oi_change,
 
-        }
+                      "timestamp": tick_time,
 
-        state[key] = candle
+                      "best_5_buy_data":
+                          message.get(
+                              "best_5_buy_data",
+                              []
+                          ),
 
-    else:
+                      "best_5_sell_data":
+                          message.get(
+                              "best_5_sell_data",
+                              []
+                          )
+                  }
 
-        candle["high"] = max(
-            candle["high"],
-            ltp
-        )
 
-        candle["low"] = min(
-            candle["low"],
-            ltp
-        )
+              except Exception as e:
 
-        candle["close"] = ltp
+                  print(
+                      "Tick parse error:",
+                      e
+                  )
 
-        candle["volume_last"] = volume
 
+          # ==========================================================
+          # CANDLE UPDATE
+          # ==========================================================
 
-# ============================================================
-# SAVE COMPLETED CANDLES
-# ============================================================
+          def update_candle(
+              name,
+              item
+          ):
 
-def save_completed_candles():
+              if item.get("ltp") is None:
+                  return
 
-    today = now_ist().strftime(
-        "%Y-%m-%d"
-    )
+              timestamp = item.get(
+                  "timestamp"
+              )
 
-    current_minute = (
-        now_ist()
-        .replace(
-            second=0,
-            microsecond=0
-        )
-        .strftime(
-            "%Y-%m-%d %H:%M"
-        )
-    )
+              if timestamp is None:
+                  timestamp = now_ist()
 
+              minute = timestamp.replace(
+                  second=0,
+                  microsecond=0
+              )
 
-    for name, candles in CANDLES.items():
+              minute_key = minute.strftime(
+                  "%Y-%m-%d %H:%M"
+              )
 
-        for key, c in candles.items():
+              ltp = float(
+                  item["ltp"]
+              )
 
-            if key == current_minute:
+              volume_day = item.get(
+                  "volume"
+              )
 
-                continue
+              state = CANDLES.get(
+                  name
+              )
 
-            if c["date"] != today:
+              if state is None:
 
-                continue
+                  CANDLES[name] = {
+                      "minute": minute_key,
+                      "open": ltp,
+                      "high": ltp,
+                      "low": ltp,
+                      "close": ltp,
+                      "volume_start":
+                          volume_day,
+                      "volume_last":
+                          volume_day
+                  }
 
-            volume = max(
-                0,
-                c["volume_last"]
-                - c["volume_start"]
-            )
+                  return
 
-            slot = c["slot"]
 
-            HISTORY.setdefault(
-                name,
-                {}
-            )
+              if state["minute"] != minute_key:
 
-            HISTORY[name].setdefault(
-                slot,
-                {}
-            )
+                  save_completed_candle(
+                      name,
+                      state
+                  )
 
-            HISTORY[name][slot][today] = volume
+                  CANDLES[name] = {
+                      "minute": minute_key,
+                      "open": ltp,
+                      "high": ltp,
+                      "low": ltp,
+                      "close": ltp,
+                      "volume_start":
+                          volume_day,
+                      "volume_last":
+                          volume_day
+                  }
 
+                  return
 
-    # Keep latest 25 sessions
-    for name in HISTORY:
 
-        for slot in HISTORY[name]:
+              state["high"] = max(
+                  state["high"],
+                  ltp
+              )
 
-            dates = sorted(
-                HISTORY[name][slot].keys()
-            )
+              state["low"] = min(
+                  state["low"],
+                  ltp
+              )
 
-            if len(dates) > 25:
+              state["close"] = ltp
 
-                for d in dates[:-25]:
+              if volume_day is not None:
 
-                    del HISTORY[name][slot][d]
+                  state["volume_last"] = volume_day
 
 
-    save_history()
+          # ==========================================================
+          # SAVE COMPLETED CANDLE
+          # ==========================================================
 
+          def save_completed_candle(
+              name,
+              candle
+          ):
 
-# ============================================================
-# 20D SAME SLOT AVERAGE
-# ============================================================
+              try:
 
-def volume_20d_average(
-    name,
-    slot,
-    today
-):
+                  minute_key = candle.get(
+                      "minute"
+                  )
 
-    records = (
-        HISTORY
-        .get(name, {})
-        .get(slot, {})
-    )
+                  if not minute_key:
+                      return
 
-    values = [
+                  date_part = minute_key[:10]
 
-        float(v)
+                  time_part = minute_key[11:16]
 
-        for d, v in records.items()
+                  volume_start = candle.get(
+                      "volume_start"
+                  )
 
-        if d != today
+                  volume_last = candle.get(
+                      "volume_last"
+                  )
 
-    ]
+                  if (
+                      volume_start is None
+                      or volume_last is None
+                  ):
 
-    values = values[
-        -REQUIRED_HISTORY_DAYS:
-    ]
+                      return
 
-    if len(values) < REQUIRED_HISTORY_DAYS:
+                  volume = max(
+                      0,
+                      volume_last -
+                      volume_start
+                  )
 
-        return None
+                  HISTORY.setdefault(
+                      name,
+                      {}
+                  )
 
-    return sum(values) / len(values)
+                  HISTORY[name].setdefault(
+                      time_part,
+                      {}
+                  )
 
+                  HISTORY[name][time_part][
+                      date_part
+                  ] = volume
 
-# ============================================================
-# PROCESS TICK
-# ============================================================
+                  # Keep latest 25 sessions
+                  dates = sorted(
+                      HISTORY[name][time_part].keys()
+                  )
 
-def process_tick(
-    token,
-    message
-):
+                  if len(dates) > 25:
 
-    try:
+                      for old_date in dates[:-25]:
 
-        token = str(token)
+                          del HISTORY[name][time_part][
+                              old_date
+                          ]
 
-        instrument = WATCHLIST.get(
-            token
-        )
+              except Exception as e:
 
-        if not instrument:
+                  print(
+                      "Save candle error:",
+                      name,
+                      e
+                  )
 
-            return
 
-        name = instrument["name"]
+          # ==========================================================
+          # SAVE ALL COMPLETED CANDLES
+          # ==========================================================
 
-        kind = instrument["kind"]
+          def save_completed_candles():
 
+              for name, candle in list(
+                  CANDLES.items()
+              ):
 
-        ltp = (
-            safe_float(
-                message.get(
-                    "last_traded_price",
-                    0
-                )
-            )
-            / 100
-        )
+                  try:
 
+                      current_minute = (
+                          now_ist()
+                          .replace(
+                              second=0,
+                              microsecond=0
+                          )
+                          .strftime(
+                              "%Y-%m-%d %H:%M"
+                          )
+                      )
 
-        volume = safe_float(
-            message.get(
-                "volume_trade_for_the_day",
-                0
-            )
-        )
+                      if candle.get(
+                          "minute"
+                      ) != current_minute:
 
+                          save_completed_candle(
+                              name,
+                              candle
+                          )
 
-        oi = safe_float(
-            message.get(
-                "open_interest",
-                0
-            )
-        )
+                          CANDLES.pop(
+                              name,
+                              None
+                          )
 
+                  except Exception as e:
 
-        close = (
-            safe_float(
-                message.get(
-                    "closed_price",
-                    0
-                )
-            )
-            / 100
-        )
+                      print(
+                          "Candle save error:",
+                          name,
+                          e
+                      )
 
 
-        avg_price = (
-            safe_float(
-                message.get(
-                    "average_traded_price",
-                    0
-                )
-            )
-            / 100
-        )
+          # ==========================================================
+          # 20 DAY SAME SLOT AVERAGE
+          # ==========================================================
 
+          def volume_20d_average(
+              name,
+              slot,
+              today
+          ):
 
-        raw_ts = (
-            message.get(
-                "exchange_timestamp"
-            )
-            or
-            message.get(
-                "last_traded_timestamp"
-            )
-        )
+              stock_data = HISTORY.get(
+                  name,
+                  {}
+              )
 
+              slot_data = stock_data.get(
+                  slot,
+                  {}
+              )
 
-        if raw_ts:
+              dates = [
+                  d
+                  for d in slot_data.keys()
+                  if d != today
+              ]
 
-            raw_ts = safe_float(
-                raw_ts
-            )
+              dates.sort(
+                  reverse=True
+              )
 
-            if raw_ts > 100_000_000_000:
+              dates = dates[:HISTORY_DAYS]
 
-                ts = raw_ts / 1000
+              if len(dates) < HISTORY_DAYS:
 
-            else:
+                  return None
 
-                ts = raw_ts
+              values = []
 
-        else:
+              for d in dates:
 
-            ts = now_ist().timestamp()
+                  try:
 
+                      values.append(
+                          float(
+                              slot_data[d]
+                          )
+                      )
 
-        old = LIVE.get(
-            token
-        )
+                  except Exception:
+                      pass
 
+              if len(values) < HISTORY_DAYS:
 
-        if old is None:
+                  return None
 
-            opening_oi = oi
+              return sum(values) / len(values)
 
-        else:
 
-            opening_oi = old.get(
-                "opening_oi",
-                oi
-            )
+          # ==========================================================
+          # BUILD WATCHLIST
+          # ==========================================================
 
+          def build_watchlist():
 
-        api_oi_change = message.get(
-            "open_interest_change_percentage"
-        )
+              global WATCHLIST
 
+              WATCHLIST = []
 
-        try:
+              if NIFTY_FUTURE:
 
-            if api_oi_change is not None:
+                  WATCHLIST.append({
+                      "exchangeType": 2,
+                      "tokens": [
+                          NIFTY_FUTURE["token"]
+                      ]
+                  })
 
-                api_oi_change = float(
-                    api_oi_change
-                )
 
-        except Exception:
+              futures_tokens = []
 
-            api_oi_change = None
+              spot_tokens = []
 
+              for name, future in FUTURES.items():
 
-        LIVE[token] = {
+                  futures_tokens.append(
+                      future["token"]
+                  )
 
-            "name": name,
-            "kind": kind,
+                  spot = SPOTS.get(
+                      name
+                  )
 
-            "ltp": ltp,
-            "volume": volume,
+                  if spot:
 
-            "oi": oi,
-            "opening_oi": opening_oi,
+                      spot_tokens.append(
+                          spot["token"]
+                      )
 
-            "oi_change_percent":
-                api_oi_change,
 
-            "close": close,
+              if futures_tokens:
 
-            "vwap":
-                avg_price,
+                  WATCHLIST.append({
+                      "exchangeType": 2,
+                      "tokens": futures_tokens
+                  })
 
-            "timestamp": ts,
 
-            "message": message
+              if spot_tokens:
 
-        }
+                  WATCHLIST.append({
+                      "exchangeType": 1,
+                      "tokens": spot_tokens
+                  })
 
 
-        if kind == "SPOT":
+              print("")
+              print(
+                  "FUTURE TOKENS:",
+                  len(futures_tokens)
+              )
 
-            update_candle(
-                name,
-                LIVE[token]
-            )
+              print(
+                  "SPOT TOKENS:",
+                  len(spot_tokens)
+              )
 
 
-        if kind == "FUTURE":
+          # ==========================================================
+          # TOKEN TO NAME
+          # ==========================================================
 
-            pc = price_change(
-                LIVE[token]
-            )
+          def token_to_name():
 
-            oc = oi_change_percent(
-                LIVE[token]
-            )
+              mapping = {}
 
-            print(
+              if NIFTY_FUTURE:
 
-                f"FUT {name:<12} "
+                  mapping[
+                      NIFTY_FUTURE["token"]
+                  ] = "NIFTY_FUTURE"
 
-                f"LTP={ltp:.2f} "
 
-                f"PC="
-                f"{pc if pc is not None else 0:.2f}% "
+              for name, item in FUTURES.items():
 
-                f"OI="
-                f"{oi / 10000000:.2f}Cr "
+                  mapping[
+                      item["token"]
+                  ] = name + "_FUTURE"
 
-                f"OIchg="
-                f"{oc if oc is not None else 0:.2f}%"
 
-            )
+              for name, item in SPOTS.items():
 
+                  mapping[
+                      item["token"]
+                  ] = name + "_SPOT"
 
-    except Exception as e:
 
-        print(
-            "Tick error:",
-            e
-        )
+              return mapping
 
 
-# ============================================================
-# BUILD WATCHLIST
-# ============================================================
+          # ==========================================================
+          # BUILD CANDIDATES
+          # ==========================================================
 
-def build_watchlist():
+          def select_candidates():
 
-    global WATCHLIST
+              candidates = []
 
-    WATCHLIST = {}
+              if not NIFTY_FUTURE:
+                  return candidates
 
+              nifty_token = NIFTY_FUTURE[
+                  "token"
+              ]
 
-    if NIFTY_FUTURE:
+              nifty_live = LIVE.get(
+                  nifty_token
+              )
 
-        token = str(
-            NIFTY_FUTURE["token"]
-        )
+              if not nifty_live:
+                  return candidates
 
-        WATCHLIST[token] = {
+              nifty_ltp = nifty_live.get(
+                  "ltp"
+              )
 
-            "name": "NIFTY",
-            "kind": "NIFTY_FUTURE"
+              nifty_avg = nifty_live.get(
+                  "average_price"
+              )
 
-        }
+              if (
+                  nifty_ltp is None
+                  or nifty_avg is None
+                  or nifty_avg <= 0
+              ):
 
+                  return candidates
 
-    for name, contracts in FUTURES.items():
 
-        if not contracts:
+              # ------------------------------------------------------
+              # MARKET CONDITION
+              # NIFTY FUTURE > VWAP
+              # ------------------------------------------------------
 
-            continue
+              if nifty_ltp <= nifty_avg:
 
-        future = contracts[0]
+                  return candidates
 
-        future_token = str(
-            future["token"]
-        )
 
-        spot = SPOTS.get(
-            name
-        )
+              for name, future in FUTURES.items():
 
-        if not spot:
+                  future_token = future[
+                      "token"
+                  ]
 
-            continue
+                  spot = SPOTS.get(
+                      name
+                  )
 
-        spot_token = str(
-            spot["token"]
-        )
+                  if not spot:
+                      continue
 
+                  spot_token = spot[
+                      "token"
+                  ]
 
-        WATCHLIST[future_token] = {
+                  future_live = LIVE.get(
+                      future_token
+                  )
 
-            "name": name,
-            "kind": "FUTURE"
+                  spot_live = LIVE.get(
+                      spot_token
+                  )
 
-        }
+                  if (
+                      not future_live
+                      or not spot_live
+                  ):
 
+                      continue
 
-        WATCHLIST[spot_token] = {
 
-            "name": name,
-            "kind": "SPOT"
+                  # ==================================================
+                  # FUTURES PRICE CHANGE
+                  # ==================================================
 
-        }
+                  pc = price_change(
+                      future_live
+                  )
 
+                  if pc is None:
+                      continue
 
-    print()
+                  if pc <= MIN_PRICE_CHANGE:
+                      continue
 
-    print(
-        "Initial subscriptions:"
-    )
 
-    print(
-        "NIFTY +",
-        len(FUTURES),
-        "stock futures"
-    )
+                  # ==================================================
+                  # FUTURES OI CHANGE
+                  # ==================================================
 
+                  oi_pc = oi_change_percent(
+                      future_live
+                  )
 
-# ============================================================
-# SELECT CANDIDATES
-# ============================================================
+                  if oi_pc is None:
+                      continue
 
-def select_candidates():
+                  if oi_pc <= MIN_OI_CHANGE:
+                      continue
 
-    candidates = []
 
+                  # ==================================================
+                  # CURRENT OI > 3 CRORE
+                  # ==================================================
 
-    nf = None
+                  current_oi = future_live.get(
+                      "oi"
+                  )
 
-    if NIFTY_FUTURE:
+                  if current_oi is None:
+                      continue
 
-        nf = LIVE.get(
-            str(
-                NIFTY_FUTURE["token"]
-            )
-        )
+                  if current_oi <= MIN_CURRENT_OI:
+                      continue
 
 
-    if not nf:
+                  # ==================================================
+                  # LONG BUILDUP
+                  # ==================================================
 
-        return []
+                  if pc <= 0 or oi_pc <= 0:
+                      continue
 
 
-    # NIFTY FUTURE > VWAP
+                  # ==================================================
+                  # STOCK SPOT > VWAP
+                  # ==================================================
 
-    if nf["vwap"] <= 0:
+                  spot_ltp = spot_live.get(
+                      "ltp"
+                  )
 
-        return []
+                  spot_avg = spot_live.get(
+                      "average_price"
+                  )
 
+                  if (
+                      spot_ltp is None
+                      or spot_avg is None
+                      or spot_avg <= 0
+                  ):
 
-    if nf["ltp"] <= nf["vwap"]:
+                      continue
 
-        return []
+                  if spot_ltp <= spot_avg:
+                      continue
 
 
-    for name, contracts in FUTURES.items():
+                  # ==================================================
+                  # ATM CE
+                  # ==================================================
 
-        if not contracts:
+                  atm_ce = find_atm_ce(
+                      name,
+                      spot_ltp
+                  )
 
-            continue
+                  if atm_ce is None:
+                      continue
 
 
-        future = contracts[0]
+                  candidates.append({
 
-        future_token = str(
-            future["token"]
-        )
+                      "name": name,
 
+                      "future_token":
+                          future_token,
 
-        spot = SPOTS.get(
-            name
-        )
+                      "spot_token":
+                          spot_token,
 
-        if not spot:
+                      "future_symbol":
+                          future["symbol"],
 
-            continue
+                      "future_ltp":
+                          future_live["ltp"],
 
+                      "price_change":
+                          pc,
 
-        spot_token = str(
-            spot["token"]
-        )
+                      "oi_change":
+                          oi_pc,
 
+                      "current_oi":
+                          current_oi,
 
-        f = LIVE.get(
-            future_token
-        )
+                      "spot_ltp":
+                          spot_ltp,
 
-        s = LIVE.get(
-            spot_token
-        )
+                      "spot_vwap":
+                          spot_avg,
 
+                      "atm_ce":
+                          atm_ce
 
-        if not f or not s:
+                  })
 
-            continue
 
+              return candidates
 
-        pc = price_change(
-            f
-        )
 
-        oi_pc = oi_change_percent(
-            f
-        )
+          # ==========================================================
+          # SUBSCRIBE ATM OPTIONS
+          # ==========================================================
 
+          def subscribe_options(
+              candidates
+          ):
 
-        if pc is None:
+              global SUBSCRIBED_OPTION_TOKENS
 
-            continue
+              if sws is None:
+                  return
 
+              new_tokens = []
 
-        if oi_pc is None:
+              for candidate in candidates:
 
-            continue
+                  option = candidate[
+                      "atm_ce"
+                  ]
 
+                  token = option[
+                      "token"
+                  ]
 
-        current_oi = f["oi"]
+                  if token not in SUBSCRIBED_OPTION_TOKENS:
 
+                      new_tokens.append(
+                          token
+                      )
 
-        # Futures price > +1.5%
+                      SUBSCRIBED_OPTION_TOKENS.add(
+                          token
+                      )
 
-        if pc <= FUTURES_PRICE_CHANGE_MIN:
 
-            continue
+              if not new_tokens:
+                  return
 
 
-        # OI change > +2%
+              print("")
+              print(
+                  "SUBSCRIBING ATM CE:",
+                  len(new_tokens)
+              )
 
-        if oi_pc <= FUTURES_OI_CHANGE_MIN:
 
-            continue
+              try:
 
+                  sws.subscribe(
+                      "atm-ce-buy-scanner",
+                      3,
+                      [{
+                          "exchangeType": 2,
+                          "tokens": new_tokens
+                      }]
+                  )
 
-        # Current OI > 3 Cr
+                  print(
+                      "ATM CE subscription successful."
+                  )
 
-        if current_oi <= FUTURES_MIN_OI:
+              except Exception as e:
 
-            continue
+                  print(
+                      "ATM CE subscription error:",
+                      e
+                  )
 
 
-        # Long buildup
+          # ==========================================================
+          # CHECK FINAL SIGNALS
+          # ==========================================================
 
-        if pc <= 0 or oi_pc <= 0:
+          def check_final_signals():
 
-            continue
+              candidates = select_candidates()
 
+              if not candidates:
+                  return
 
-        # Spot > VWAP
 
-        if s["vwap"] <= 0:
+              subscribe_options(
+                  candidates
+              )
 
-            continue
 
+              today = today_string()
 
-        if s["ltp"] <= s["vwap"]:
+              for candidate in candidates:
 
-            continue
+                  name = candidate[
+                      "name"
+                  ]
 
+                  option = candidate[
+                      "atm_ce"
+                  ]
 
-        # ATM CE
+                  option_token = option[
+                      "token"
+                  ]
 
-        ce = find_atm_ce(
-            name,
-            s["ltp"]
-        )
+                  option_live = LIVE.get(
+                      option_token
+                  )
 
+                  if not option_live:
 
-        if not ce:
+                      continue
 
-            continue
 
+                  # ==================================================
+                  # OPTION BEST BID / ASK
+                  # ==================================================
 
-        ce_token = str(
-            ce["token"]
-        )
+                  bid_qty, bid_price = best_buy(
+                      option_live
+                  )
 
+                  ask_qty, ask_price = best_sell(
+                      option_live
+                  )
 
-        candidates.append({
+                  if ask_qty <= 0:
+                      continue
 
-            "name": name,
+                  if bid_qty <= 0:
+                      continue
 
-            "future": future,
 
-            "future_live": f,
+                  ratio = (
+                      bid_qty / ask_qty
+                  )
 
-            "spot_live": s,
 
-            "ce": ce,
+                  # BID >= 1.8 X ASK
+                  if ratio < MIN_BID_ASK_RATIO:
 
-            "ce_token": ce_token
+                      continue
 
-        })
 
+                  # ==================================================
+                  # LAST 3 COMPLETED CANDLES
+                  # ==================================================
 
-    return candidates
+                  candle_list = get_last_3_completed_candles(
+                      name
+                  )
 
+                  if len(candle_list) < 3:
 
-# ============================================================
-# OPTION SUBSCRIPTION
-# ============================================================
+                      continue
 
-def subscribe_options(
-    candidates
-):
 
-    if not sws:
+                  # ==================================================
+                  # AT LEAST 2 GREEN
+                  # ==================================================
 
-        return
+                  green_count = 0
 
+                  for candle in candle_list:
 
-    new_tokens = []
+                      if candle["close"] > candle["open"]:
 
+                          green_count += 1
 
-    for c in candidates:
 
-        token = str(
-            c["ce_token"]
-        )
+                  if green_count < 2:
 
+                      continue
 
-        WATCHLIST[token] = {
 
-            "name": c["name"],
-            "kind": "OPTION"
+                  # ==================================================
+                  # EVERY CANDLE VOLUME > 20D AVERAGE
+                  # ==================================================
 
-        }
+                  volume_condition = True
 
+                  for candle in candle_list:
 
-        if token not in SUBSCRIBED_OPTION_TOKENS:
+                      slot = candle["slot"]
 
-            new_tokens.append(
-                token
-            )
+                      candle_volume = candle[
+                          "volume"
+                      ]
 
+                      average_20d = volume_20d_average(
+                          name,
+                          slot,
+                          today
+                      )
 
-    if not new_tokens:
+                      if average_20d is None:
 
-        return
+                          volume_condition = False
 
+                          break
 
-    print()
 
-    print(
-        "NEW OPTION WATCHLIST:"
-    )
+                      if candle_volume <= average_20d:
 
+                          volume_condition = False
 
-    for c in candidates:
+                          break
 
-        token = str(
-            c["ce_token"]
-        )
 
+                  if not volume_condition:
 
-        if token in new_tokens:
+                      continue
 
-            print(
 
-                c["name"],
-                "ATM CE:",
-                c["ce"]["symbol"],
-                "TOKEN:",
-                token
+                  # ==================================================
+                  # DUPLICATE SIGNAL PROTECTION
+                  # ==================================================
 
-            )
+                  signal_key = (
+                      today,
+                      name
+                  )
 
+                  if signal_key in LAST_SIGNAL:
 
-    token_list = [
+                      continue
 
-        {
 
-            "exchangeType": 2,
+                  # ==================================================
+                  # GET NIFTY LIVE
+                  # ==================================================
 
-            "tokens":
-                new_tokens
+                  nifty_live = LIVE.get(
+                      NIFTY_FUTURE["token"]
+                  )
 
-        }
+                  if not nifty_live:
 
-    ]
+                      continue
 
 
-    try:
+                  # ==================================================
+                  # FINAL BUY SIGNAL
+                  # ==================================================
 
-        sws.subscribe(
-            "option-watch",
-            3,
-            token_list
-        )
+                  LAST_SIGNAL[
+                      signal_key
+                  ] = True
 
 
-        for token in new_tokens:
+                  message = (
+                      "🟢 FINAL BUY ALERT\n"
+                      "\n"
+                      f"STOCK: {name}\n"
+                      f"FUTURE: {candidate['future_symbol']}\n"
+                      f"FUTURE LTP: "
+                      f"{candidate['future_ltp']:.2f}\n"
+                      f"PRICE CHANGE: "
+                      f"{candidate['price_change']:.2f}%\n"
+                      f"OI CHANGE: "
+                      f"{candidate['oi_change']:.2f}%\n"
+                      f"CURRENT OI: "
+                      f"{candidate['current_oi']:.0f}\n"
+                      "\n"
+                      f"SPOT LTP: "
+                      f"{candidate['spot_ltp']:.2f}\n"
+                      f"SPOT VWAP: "
+                      f"{candidate['spot_vwap']:.2f}\n"
+                      "\n"
+                      f"ATM CE: "
+                      f"{option['symbol']}\n"
+                      f"STRIKE: "
+                      f"{option['strike']:.2f}\n"
+                      f"CE BID QTY: "
+                      f"{bid_qty:.0f}\n"
+                      f"CE ASK QTY: "
+                      f"{ask_qty:.0f}\n"
+                      f"BID/ASK: "
+                      f"{ratio:.2f}x\n"
+                      "\n"
+                      f"3 CANDLES GREEN: "
+                      f"{green_count}/3\n"
+                      f"VOLUME: "
+                      f"3/3 ABOVE 20D AVG\n"
+                      "\n"
+                      f"NIFTY FUTURE > VWAP: YES\n"
+                      "\n"
+                      f"TIME: "
+                      f"{current_time_string()}"
+                  )
 
-            SUBSCRIBED_OPTION_TOKENS.add(
-                token
-            )
 
+                  print("")
+                  print("=" * 70)
+                  print(message)
+                  print("=" * 70)
 
-        print(
-            "ATM CE subscription sent:",
-            len(new_tokens)
-        )
 
+                  save_signal(
+                      candidate,
+                      option,
+                      bid_qty,
+                      ask_qty,
+                      ratio,
+                      green_count
+                  )
 
-    except Exception as e:
 
-        print(
-            "Option subscribe error:",
-            e
-        )
+                  send_telegram(
+                      message
+                  )
 
 
-# ============================================================
-# FINAL SIGNAL CHECK
-# ============================================================
+          # ==========================================================
+          # GET LAST 3 COMPLETED CANDLES
+          # ==========================================================
 
-def check_final_signals():
+          def get_last_3_completed_candles(
+              name
+          ):
 
-    today = now_ist().strftime(
-        "%Y-%m-%d"
-    )
+              candles = []
 
+              stock_state = HISTORY.get(
+                  name,
+                  {}
+              )
 
-    candidates = select_candidates()
+              if not stock_state:
+                  return candles
 
 
-    if not candidates:
+              today = today_string()
 
-        print(
-            "No stock passed futures/market/spot filters"
-        )
+              for slot, date_data in stock_state.items():
 
-        return
+                  if today not in date_data:
+                      continue
 
+                  try:
 
-    print(
-        "Candidates:",
-        len(candidates)
-    )
+                      volume = float(
+                          date_data[today]
+                      )
 
+                  except Exception:
 
-    subscribe_options(
-        candidates
-    )
+                      continue
 
 
-    for c in candidates:
+                  # Candle OHLC is not stored in history,
+                  # therefore use current in-memory completed
+                  # candles when available.
 
-        name = c["name"]
+              # ------------------------------------------------------
+              # Build from in-memory candle archive
+              # ------------------------------------------------------
 
-        future = c["future_live"]
+              archive = CANDLE_ARCHIVE.get(
+                  name,
+                  []
+              )
 
-        spot = c["spot_live"]
+              if len(archive) < 3:
 
-        ce = c["ce"]
+                  return []
 
-        ce_token = c["ce_token"]
 
+              return archive[-3:]
 
-        option = LIVE.get(
-            ce_token
-        )
 
+          # ==========================================================
+          # CANDLE ARCHIVE
+          # ==========================================================
 
-        if not option:
+          CANDLE_ARCHIVE = {}
 
-            continue
 
+          # ==========================================================
+          # SAVE COMPLETED CANDLE WITH OHLC
+          # ==========================================================
 
-        # ========================================================
-        # OPTION BUY / SELL RATIO
-        # ========================================================
+          def archive_completed_candle(
+              name,
+              candle
+          ):
 
-        buy_qty, buy_price = best_buy(
-            option
-        )
+              try:
 
-        sell_qty, sell_price = best_sell(
-            option
-        )
+                  minute_key = candle.get(
+                      "minute"
+                  )
 
+                  if not minute_key:
+                      return
 
-        if sell_qty <= 0:
 
-            continue
+                  volume_start = candle.get(
+                      "volume_start"
+                  )
 
+                  volume_last = candle.get(
+                      "volume_last"
+                  )
 
-        if buy_qty <= 0:
+                  if (
+                      volume_start is None
+                      or volume_last is None
+                  ):
 
-            continue
+                      return
 
 
-        ratio = (
-            buy_qty
-            / sell_qty
-        )
+                  volume = max(
+                      0,
+                      volume_last -
+                      volume_start
+                  )
 
 
-        if ratio < OPTION_BUY_SELL_RATIO:
+                  slot = minute_key[11:16]
 
-            print(
 
-                f"{name} CE Bid/Ask "
-                f"{ratio:.2f}x < 1.8x"
+                  record = {
 
-            )
+                      "minute": minute_key,
 
-            continue
+                      "slot": slot,
 
+                      "open": float(
+                          candle["open"]
+                      ),
 
-        # ========================================================
-        # LAST 3 COMPLETED CANDLES
-        # ========================================================
+                      "high": float(
+                          candle["high"]
+                      ),
 
-        candles = CANDLES.get(
-            name,
-            {}
-        )
+                      "low": float(
+                          candle["low"]
+                      ),
 
+                      "close": float(
+                          candle["close"]
+                      ),
 
-        completed = []
+                      "volume": float(
+                          volume
+                      )
+                  }
 
 
-        current_minute = (
-            now_ist()
-            .replace(
-                second=0,
-                microsecond=0
-            )
-            .strftime(
-                "%Y-%m-%d %H:%M"
-            )
-        )
+                  CANDLE_ARCHIVE.setdefault(
+                      name,
+                      []
+                  )
 
+                  CANDLE_ARCHIVE[name].append(
+                      record
+                  )
 
-        for key, candle in candles.items():
 
-            if key == current_minute:
+                  # Keep latest 100 candles
+                  CANDLE_ARCHIVE[name] = (
+                      CANDLE_ARCHIVE[name][-100:]
+                  )
 
-                continue
 
+              except Exception as e:
 
-            if candle["date"] != today:
+                  print(
+                      "Archive candle error:",
+                      name,
+                      e
+                  )
 
-                continue
 
+          # ==========================================================
+          # PATCH CANDLE SAVE
+          # ==========================================================
 
-            completed.append(
-                candle
-            )
+          original_save_completed_candle = (
+              save_completed_candle
+          )
 
 
-        completed.sort(
-            key=lambda x: x["slot"]
-        )
+          def save_completed_candle(
+              name,
+              candle
+          ):
 
+              archive_completed_candle(
+                  name,
+                  candle
+              )
 
-        completed = completed[-3:]
+              original_save_completed_candle(
+                  name,
+                  candle
+              )
 
 
-        if len(completed) < 3:
+          # ==========================================================
+          # SAVE SIGNAL CSV
+          # ==========================================================
 
-            print(
-                f"{name}: less than 3 completed candles"
-            )
+          def save_signal(
+              candidate,
+              option,
+              bid_qty,
+              ask_qty,
+              ratio,
+              green_count
+          ):
 
-            continue
+              exists = os.path.exists(
+                  SIGNAL_FILE
+              )
 
+              try:
 
-        green_count = sum(
+                  with open(
+                      SIGNAL_FILE,
+                      "a",
+                      newline="",
+                      encoding="utf-8"
+                  ) as f:
 
-            1
+                      writer = csv.writer(f)
 
-            for x in completed
+                      if not exists:
 
-            if x["close"] > x["open"]
+                          writer.writerow([
+                              "date",
+                              "time",
+                              "stock",
+                              "future",
+                              "future_ltp",
+                              "price_change_pct",
+                              "oi_change_pct",
+                              "current_oi",
+                              "spot_ltp",
+                              "spot_vwap",
+                              "atm_ce",
+                              "strike",
+                              "bid_qty",
+                              "ask_qty",
+                              "bid_ask_ratio",
+                              "green_candles",
+                              "volume_condition"
+                          ])
 
-        )
 
+                      writer.writerow([
 
-        if green_count < MIN_GREEN_CANDLES:
+                          today_string(),
 
-            print(
+                          current_time_string(),
 
-                f"{name}: "
-                f"green candles "
-                f"{green_count}/3"
+                          candidate["name"],
 
-            )
+                          candidate["future_symbol"],
 
-            continue
+                          candidate["future_ltp"],
 
+                          candidate["price_change"],
 
-        # ========================================================
-        # 20D VOLUME
-        # ========================================================
+                          candidate["oi_change"],
 
-        volume_ok = True
+                          candidate["current_oi"],
 
-        volume_details = []
+                          candidate["spot_ltp"],
 
+                          candidate["spot_vwap"],
 
-        for candle in completed:
+                          option["symbol"],
 
-            slot = candle["slot"]
+                          option["strike"],
 
+                          bid_qty,
 
-            avg20 = volume_20d_average(
+                          ask_qty,
 
-                name,
+                          ratio,
 
-                slot,
+                          green_count,
 
-                today
+                          "3/3 ABOVE 20D AVG"
 
-            )
+                      ])
 
 
-            current_volume = max(
+                  print(
+                      "Signal saved:",
+                      candidate["name"]
+                  )
 
-                0,
+              except Exception as e:
 
-                candle["volume_last"]
-                - candle["volume_start"]
+                  print(
+                      "Signal CSV error:",
+                      e
+                  )
 
-            )
 
+          # ==========================================================
+          # WEBSOCKET CALLBACK
+          # ==========================================================
 
-            if avg20 is None:
+          def on_data(wsapp, message):
 
-                volume_ok = False
+              try:
 
-                volume_details.append(
+                  if isinstance(
+                      message,
+                      str
+                  ):
 
-                    f"{slot}: HISTORY<20"
+                      try:
 
-                )
+                          message = json.loads(
+                              message
+                          )
 
-                break
+                      except Exception:
 
+                          return
 
-            if (
-                current_volume
-                > avg20 * VOLUME_MULTIPLIER
-            ):
 
-                volume_details.append(
+                  if not isinstance(
+                      message,
+                      dict
+                  ):
 
-                    f"{slot}: "
-                    f"{current_volume:.0f}>"
-                    f"{avg20:.0f}"
+                      return
 
-                )
 
-            else:
+                  process_tick(
+                      message
+                  )
 
-                volume_ok = False
 
-                volume_details.append(
+                  token = str(
+                      message.get(
+                          "token",
+                          ""
+                      )
+                  )
 
-                    f"{slot}: "
-                    f"{current_volume:.0f}<="
-                    f"{avg20:.0f}"
+                  if not token:
+                      return
 
-                )
 
-                break
+                  # --------------------------------------------------
+                  # FIND STOCK SPOT
+                  # --------------------------------------------------
 
+                  for name, spot in SPOTS.items():
 
-        if not volume_ok:
+                      if spot["token"] == token:
 
-            print(
-                f"{name}: 20D volume failed"
-            )
+                          item = LIVE.get(
+                              token
+                          )
 
-            continue
+                          if item:
 
+                              update_candle(
+                                  name,
+                                  item
+                              )
 
-        # ========================================================
-        # DUPLICATE SIGNAL
-        # ========================================================
+                          break
 
-        signal_key = (
-            name
-            + "_"
-            + today
-        )
 
+              except Exception as e:
 
-        if LAST_SIGNAL.get(
-            signal_key
-        ):
+                  print(
+                      "WebSocket data error:",
+                      e
+                  )
 
-            continue
 
+          # ==========================================================
+          # WEBSOCKET OPEN
+          # ==========================================================
 
-        LAST_SIGNAL[
-            signal_key
-        ] = True
+          def on_open(wsapp):
 
+              global WS_READY
 
-        # ========================================================
-        # FINAL ALERT
-        # ========================================================
+              print("")
+              print("=" * 70)
+              print("ANGEL ONE WEBSOCKET CONNECTED")
+              print("=" * 70)
 
-        pc = price_change(
-            future
-        )
+              WS_READY = True
 
-        oi_pc = oi_change_percent(
-            future
-        )
+              try:
 
+                  if WATCHLIST:
 
-        nifty_live = LIVE.get(
-            str(
-                NIFTY_FUTURE["token"]
-            )
-        )
+                      sws.subscribe(
+                          "futures-oi-vwap-buy",
+                          3,
+                          WATCHLIST
+                      )
 
+                      print(
+                          "Initial subscriptions sent."
+                      )
 
-        if not nifty_live:
+              except Exception as e:
 
-            continue
+                  print(
+                      "Initial subscribe error:",
+                      e
+                  )
 
 
-        message = (
+          # ==========================================================
+          # WEBSOCKET ERROR
+          # ==========================================================
 
-            "🟢 FINAL BUY ALERT\n\n"
+          def on_error(wsapp, error):
 
-            f"STOCK: {name}\n"
-            f"SPOT: ₹{spot['ltp']:.2f}\n\n"
+              print(
+                  "WebSocket ERROR:",
+                  error
+              )
 
-            "STOCK FUTURES\n"
 
-            f"Price Change: +{pc:.2f}%\n"
+          # ==========================================================
+          # WEBSOCKET CLOSE
+          # ==========================================================
 
-            f"OI Change: +{oi_pc:.2f}%\n"
+          def on_close(
+              wsapp,
+              close_code=None,
+              close_reason=None
+          ):
 
-            f"Current OI: "
-            f"{future['oi']/10000000:.2f} Cr\n"
+              global WS_READY
 
-            "Long Buildup: YES\n\n"
+              WS_READY = False
 
-            "MARKET\n"
+              print(
+                  "WebSocket closed:",
+                  close_code,
+                  close_reason
+              )
 
-            f"NIFTY FUTURE: "
-            f"₹{nifty_live['ltp']:.2f}\n"
 
-            f"NIFTY AVG/VWAP: "
-            f"₹{nifty_live['vwap']:.2f}\n\n"
+          # ==========================================================
+          # STRATEGY LOOP
+          # ==========================================================
 
-            "STOCK\n"
+          def strategy_loop():
 
-            f"Spot AVG/VWAP: "
-            f"₹{spot['vwap']:.2f}\n\n"
+              print("")
+              print("=" * 70)
+              print("STRATEGY LOOP STARTED")
+              print("=" * 70)
 
-            "OPTION\n"
+              last_history_save = 0
 
-            f"ATM CE: {ce['symbol']}\n"
+              while True:
 
-            f"CE Bid Qty: "
-            f"{buy_qty:.0f}\n"
+                  try:
 
-            f"CE Ask Qty: "
-            f"{sell_qty:.0f}\n"
+                      current = now_ist()
 
-            f"Bid/Ask Qty: "
-            f"{ratio:.2f}x\n\n"
+                      current_hm = current.strftime(
+                          "%H:%M"
+                      )
 
-            "PRICE ACTION\n"
+                      if current_hm > MARKET_END:
 
-            f"Last 3 candles green: "
-            f"{green_count}/3\n"
+                          print(
+                              "Market time finished."
+                          )
 
-            "20D Volume: PASS\n\n"
+                          break
 
-            f"TIME: "
-            f"{now_ist().strftime('%H:%M:%S')} IST"
 
-        )
+                      if current_hm < MARKET_START:
 
+                          time.sleep(2)
 
-        print()
+                          continue
 
-        print(
-            "=" * 80
-        )
 
-        print(
-            message
-        )
+                      # ------------------------------------------------
+                      # SAVE COMPLETED CANDLES
+                      # ------------------------------------------------
 
-        print(
-            "=" * 80
-        )
+                      save_completed_candles()
 
 
-        send_telegram(
-            message
-        )
+                      # ------------------------------------------------
+                      # CHECK SIGNALS
+                      # ------------------------------------------------
 
+                      check_final_signals()
 
-        save_signal(
 
-            c,
+                      # ------------------------------------------------
+                      # PERIODIC HISTORY SAVE
+                      # ------------------------------------------------
 
-            ratio,
+                      current_ts = time.time()
 
-            green_count,
+                      if (
+                          current_ts -
+                          last_history_save
+                          >= 60
+                      ):
 
-            volume_details
+                          save_history()
 
-        )
+                          last_history_save = current_ts
 
 
-# ============================================================
-# SAVE SIGNAL
-# ============================================================
+                      time.sleep(10)
 
-def save_signal(
-    candidate,
-    ratio,
-    green_count,
-    volume_details
-):
 
-    exists = os.path.exists(
-        SIGNAL_FILE
-    )
+                  except KeyboardInterrupt:
 
+                      print(
+                          "Keyboard interrupt."
+                      )
 
-    with open(
+                      break
 
-        SIGNAL_FILE,
+                  except Exception as e:
 
-        "a",
+                      print(
+                          "Strategy loop error:",
+                          e
+                      )
 
-        newline="",
+                      time.sleep(5)
 
-        encoding="utf-8"
 
-    ) as f:
+          # ==========================================================
+          # LOGIN
+          # ==========================================================
 
+          def login():
 
-        writer = csv.writer(
-            f
-        )
+              global smart_api
 
+              print("")
+              print("=" * 70)
+              print("ANGEL ONE LOGIN")
+              print("=" * 70)
 
-        if not exists:
+              try:
 
-            writer.writerow([
+                  smart_api = SmartConnect(
+                      api_key=ANGEL_API_KEY
+                  )
 
-                "TIME",
-                "STOCK",
-                "FUTURE",
-                "SPOT",
-                "ATM_CE",
-                "CE_BID_QTY",
-                "CE_ASK_QTY",
-                "BID_ASK_RATIO",
-                "GREEN_CANDLES",
-                "VOLUME_CHECK"
+                  totp = pyotp.TOTP(
+                      ANGEL_TOTP
+                  ).now()
 
-            ])
+                  data = smart_api.generateSession(
+                      ANGEL_CLIENT_ID,
+                      ANGEL_PASSWORD,
+                      totp
+                  )
 
+                  if not data:
 
-        option = LIVE.get(
-            candidate["ce_token"]
-        )
+                      print(
+                          "Login failed."
+                      )
 
+                      return False
 
-        if not option:
 
-            return
+                  if not data.get(
+                      "status",
+                      False
+                  ):
 
+                      print(
+                          "Login failed:",
+                          data
+                      )
 
-        bid_qty, _ = best_buy(
-            option
-        )
+                      return False
 
-        ask_qty, _ = best_sell(
-            option
-        )
 
+                  print(
+                      "LOGIN SUCCESS"
+                  )
 
-        writer.writerow([
+                  return True
 
-            now_ist().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
 
-            candidate["name"],
+              except Exception as e:
 
-            candidate["future"]["symbol"],
+                  print(
+                      "Login error:",
+                      e
+                  )
 
-            candidate["spot_live"]["ltp"],
+                  return False
 
-            candidate["ce"]["symbol"],
 
-            bid_qty,
+          # ==========================================================
+          # MAIN
+          # ==========================================================
 
-            ask_qty,
+          def main():
 
-            ratio,
+              global sws
 
-            green_count,
 
-            " | ".join(
-                volume_details
-            )
+              print("")
+              print("=" * 80)
+              print("🚀 FUTURES OI + VWAP + ATM CE BUY SCANNER")
+              print("=" * 80)
+              print("")
+              print("ALL CONDITIONS MUST PASS")
+              print("")
+              print("FUTURES:")
+              print("  Price Change > +1.5%")
+              print("  OI Change > +2%")
+              print("  Current OI > 3 Crore")
+              print("  Long Buildup")
+              print("")
+              print("MARKET:")
+              print("  Nifty Futures > VWAP")
+              print("")
+              print("STOCK:")
+              print("  Spot > Day VWAP")
+              print("")
+              print("OPTION:")
+              print("  Nearest Expiry ATM CE")
+              print("  CE Bid Qty / Ask Qty >= 1.8x")
+              print("")
+              print("PRICE ACTION:")
+              print("  Last 3 completed 1-min candles")
+              print("  At least 2 Green")
+              print("  Every candle volume > 20D same-slot average")
+              print("")
+              print("NO AUTOMATIC ORDER PLACEMENT")
+              print("BUY ALERT ONLY")
+              print("=" * 80)
 
-        ])
 
+              # ======================================================
+              # WAIT FOR MARKET
+              # ======================================================
 
-# ============================================================
-# WEBSOCKET DATA
-# ============================================================
+              while True:
 
-def on_data(
-    wsapp,
-    message
-):
+                  now = now_ist()
 
-    if not isinstance(
-        message,
-        dict
-    ):
+                  hm = now.strftime(
+                      "%H:%M"
+                  )
 
-        return
+                  if hm >= MARKET_START:
+                      break
 
+                  print(
+                      "Waiting for market:",
+                      now.strftime(
+                          "%H:%M:%S"
+                      )
+                  )
 
-    token = message.get(
-        "token"
-    )
+                  time.sleep(10)
 
 
-    if not token:
+              if hm > MARKET_END:
 
-        return
+                  print(
+                      "Market already closed."
+                  )
 
+                  return
 
-    process_tick(
-        token,
-        message
-    )
 
+              # ======================================================
+              # LOAD HISTORY
+              # ======================================================
 
-# ============================================================
-# WEBSOCKET OPEN
-# ============================================================
+              load_history()
 
-def on_open(
-    wsapp
-):
 
-    print()
+              # ======================================================
+              # LOGIN
+              # ======================================================
 
-    print(
-        "WebSocket connected"
-    )
+              if not login():
 
+                  return
 
-    # New connection = fresh subscription state
-    SUBSCRIBED_OPTION_TOKENS.clear()
 
+              # ======================================================
+              # MASTER
+              # ======================================================
 
-    token_list = []
+              if not download_master():
 
-    nse_fo_tokens = []
-    nse_cm_tokens = []
+                  return
 
 
-    for token, info in WATCHLIST.items():
+              # ======================================================
+              # CONTRACTS
+              # ======================================================
 
-        if info["kind"] in (
-            "FUTURE",
-            "NIFTY_FUTURE"
-        ):
+              build_contracts()
 
-            nse_fo_tokens.append(
-                token
-            )
 
-        elif info["kind"] == "SPOT":
+              if not NIFTY_FUTURE:
 
-            nse_cm_tokens.append(
-                token
-            )
+                  print(
+                      "NIFTY FUTURE NOT FOUND."
+                  )
 
+                  return
 
-    if nse_cm_tokens:
 
-        token_list.append({
+              if not FUTURES:
 
-            "exchangeType": 1,
+                  print(
+                      "NO STOCK FUTURES FOUND."
+                  )
 
-            "tokens":
-                nse_cm_tokens
+                  return
 
-        })
 
+              # ======================================================
+              # WATCHLIST
+              # ======================================================
 
-    if nse_fo_tokens:
+              build_watchlist()
 
-        token_list.append({
 
-            "exchangeType": 2,
+              # ======================================================
+              # TELEGRAM START
+              # ======================================================
 
-            "tokens":
-                nse_fo_tokens
+              send_telegram(
+                  "🚀 FUTURES OI + VWAP + ATM CE BUY SCANNER STARTED\n"
+                  "\n"
+                  "Market: 09:15 - 15:00 IST\n"
+                  "Futures OI + Price + VWAP\n"
+                  "ATM CE Bid/Ask\n"
+                  "3 Candle Volume Confirmation"
+              )
 
-        })
 
+              # ======================================================
+              # WEBSOCKET AUTH
+              # ======================================================
 
-    if not token_list:
+              try:
 
-        print(
-            "No initial tokens to subscribe"
-        )
+                  feed_token = (
+                      smart_api.getfeedToken()
+                  )
 
-        return
+                  client_code = (
+                      ANGEL_CLIENT_ID
+                  )
 
 
-    try:
+                  sws = SmartWebSocketV2(
+                      smart_api.access_token,
+                      ANGEL_API_KEY,
+                      client_code,
+                      feed_token
+                  )
 
-        sws.subscribe(
 
-            "futures-vwap-scan",
+                  sws.on_data = on_data
+                  sws.on_open = on_open
+                  sws.on_error = on_error
+                  sws.on_close = on_close
 
-            3,
 
-            token_list
+                  print("")
+                  print(
+                      "STARTING ANGEL ONE WEBSOCKET..."
+                  )
 
-        )
 
+                  ws_thread = threading.Thread(
+                      target=sws.connect,
+                      daemon=True
+                  )
 
-        print(
-            "Futures + Spot subscription sent"
-        )
+                  ws_thread.start()
 
-        print(
-            "Spot tokens:",
-            len(nse_cm_tokens)
-        )
 
-        print(
-            "Futures tokens:",
-            len(nse_fo_tokens)
-        )
+              except Exception as e:
 
+                  print(
+                      "WebSocket start error:",
+                      e
+                  )
 
-    except Exception as e:
+                  return
 
-        print(
-            "Subscription error:",
-            e
-        )
 
+              # ======================================================
+              # STRATEGY
+              # ======================================================
 
-# ============================================================
-# WEBSOCKET ERROR
-# ============================================================
+              try:
 
-def on_error(
-    wsapp,
-    error
-):
+                  strategy_loop()
 
-    print(
-        "WebSocket error:",
-        error
-    )
+              except KeyboardInterrupt:
 
+                  print(
+                      "Scanner stopped."
+                  )
 
-# ============================================================
-# WEBSOCKET CLOSE
-# ============================================================
+              finally:
 
-def on_close(
-    wsapp
-):
+                  save_completed_candles()
 
-    print(
-        "WebSocket closed"
-    )
+                  save_history()
 
 
-# ============================================================
-# STRATEGY LOOP
-# ============================================================
+                  try:
 
-def strategy_loop():
+                      if sws:
 
-    last_check = 0
+                          sws.close()
 
+                  except Exception:
+                      pass
 
-    while True:
 
-        if market_time() >= END_TIME:
+                  send_telegram(
+                      "🛑 FUTURES OI + VWAP + ATM CE BUY SCANNER STOPPED"
+                  )
 
-            print(
-                "15:00 IST reached."
-            )
 
+                  print("")
+                  print("=" * 70)
+                  print("SCANNER FINISHED")
+                  print("=" * 70)
 
-            try:
 
-                sws.close_connection()
+          # ==========================================================
+          # RUN
+          # ==========================================================
 
-            except Exception:
+          if __name__ == "__main__":
 
-                pass
+              main()
 
+          PYTHON
 
-            break
 
-
-        now_ts = time.time()
-
-
-        if now_ts - last_check >= 10:
-
-            last_check = now_ts
-
-
-            try:
-
-                save_completed_candles()
-
-            except Exception as e:
-
-                print(
-                    "History save error:",
-                    e
-                )
-
-
-            print()
-
-            print(
-                "Running strategy scan:",
-                now_ist().strftime(
-                    "%H:%M:%S"
-                )
-            )
-
-
-            try:
-
-                check_final_signals()
-
-            except Exception as e:
-
-                print(
-                    "Strategy error:",
-                    e
-                )
-
-
-        time.sleep(1)
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-
-    global smart_api
-    global sws
-    global MASTER
-
-
-    print()
-
-    print(
-        "=" * 80
-    )
-
-    print(
-        "FUTURES OI + VWAP + ATM CE BUY SCANNER"
-    )
-
-    print(
-        "=" * 80
-    )
-
-    print()
-
-    print(
-        "TIME: 09:15 -> 15:00 IST"
-    )
-
-    print(
-        "FUTURES PRICE CHANGE > +1.5%"
-    )
-
-    print(
-        "FUTURES OI CHANGE > +2%"
-    )
-
-    print(
-        "CURRENT OI > 3 Cr"
-    )
-
-    print(
-        "LONG BUILDUP"
-    )
-
-    print(
-        "NIFTY FUTURE > VWAP"
-    )
-
-    print(
-        "SPOT > DAY VWAP"
-    )
-
-    print(
-        "ATM CE"
-    )
-
-    print(
-        "CE BID / ASK QTY >= 1.8x"
-    )
-
-    print(
-        "LAST 3 CANDLES: >= 2 GREEN"
-    )
-
-    print(
-        "VOLUME > 20D SAME-SLOT AVG"
-    )
-
-    print()
-
-
-    print(
-        "UTC NOW:",
-        datetime.now(
-            timezone.utc
-        ).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-    )
-
-
-    print(
-        "IST NOW:",
-        now_ist().strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-    )
-
-    print()
-
-
-    # ========================================================
-    # SECRET CHECK
-    # ========================================================
-
-    missing = []
-
-
-    if not API_KEY:
-
-        missing.append(
-            "ANGEL_API_KEY"
-        )
-
-
-    if not CLIENT_ID:
-
-        missing.append(
-            "ANGEL_CLIENT_ID"
-        )
-
-
-    if not PASSWORD:
-
-        missing.append(
-            "ANGEL_PASSWORD"
-        )
-
-
-    if not TOTP_SECRET:
-
-        missing.append(
-            "ANGEL_TOTP"
-        )
-
-
-    if missing:
-
-        print(
-            "Missing Angel secrets:",
-            ", ".join(missing)
-        )
-
-        return
-
-
-    if TELEGRAM_BOT_TOKEN:
-
-        print(
-            "TELEGRAM_BOT_TOKEN loaded"
-        )
-
-    else:
-
-        print(
-            "TELEGRAM_BOT_TOKEN missing"
-        )
-
-
-    if TELEGRAM_CHAT_ID:
-
-        print(
-            "TELEGRAM_CHAT_ID loaded"
-        )
-
-    else:
-
-        print(
-            "TELEGRAM_CHAT_ID missing"
-        )
-
-
-    # ========================================================
-    # WAIT FOR MARKET
-    # ========================================================
-
-    while market_time() < START_TIME:
-
-        print(
-
-            "Waiting for 09:15 IST...",
-
-            now_ist().strftime(
-                "%H:%M:%S"
-            )
-
-        )
-
-        time.sleep(5)
-
-
-    if market_time() >= END_TIME:
-
-        print(
-            "Market window finished."
-        )
-
-        return
-
-
-    # ========================================================
-    # LOGIN
-    # ========================================================
-
-    print()
-
-    print(
-        "Logging into Angel One..."
-    )
-
-
-    try:
-
-        smart_api = SmartConnect(
-            api_key=API_KEY
-        )
-
-
-        totp = pyotp.TOTP(
-            TOTP_SECRET
-        ).now()
-
-
-        session = smart_api.generateSession(
-
-            CLIENT_ID,
-
-            PASSWORD,
-
-            totp
-
-        )
-
-
-        if not session:
-
-            print(
-                "Login failed"
-            )
-
-            return
-
-
-        if not session.get(
-            "status",
-            False
-        ):
-
-            print(
-                "Angel login failed:",
-                session
-            )
-
-            return
-
-
-        auth_token = session[
-            "data"
-        ][
-            "jwtToken"
-        ]
-
-
-        feed_token = (
-            smart_api.getfeedToken()
-        )
-
-
-        print(
-            "Angel login SUCCESS"
-        )
-
-
-    except Exception as e:
-
-        print(
-            "Login error:",
-            e
-        )
-
-        return
-
-
-    # ========================================================
-    # MASTER
-    # ========================================================
-
-    try:
-
-        MASTER = download_master()
-
-        build_contracts()
-
-        build_watchlist()
-
-
-    except Exception as e:
-
-        print(
-            "Master error:",
-            e
-        )
-
-        return
-
-
-    if not NIFTY_FUTURE:
-
-        print(
-            "NIFTY FUTURE not found."
-        )
-
-        return
-
-
-    if not FUTURES:
-
-        print(
-            "Stock futures not found."
-        )
-
-        return
-
-
-    # ========================================================
-    # TELEGRAM START
-    # ========================================================
-
-    send_telegram(
-
-        "🟢 FUTURES BUY SCANNER STARTED\n\n"
-
-        "Conditions:\n"
-
-        "Futures Price > +1.5%\n"
-
-        "OI Change > +2%\n"
-
-        "OI > 3 Cr\n"
-
-        "Long Buildup\n"
-
-        "Nifty Future > VWAP\n"
-
-        "Spot > VWAP\n"
-
-        "ATM CE Bid/Ask >= 1.8x\n"
-
-        "Last 3 candles >= 2 Green\n"
-
-        "Volume > 20D same-slot average\n\n"
-
-        "09:15 -> 15:00 IST"
-
-    )
-
-
-    # ========================================================
-    # WEBSOCKET
-    # ========================================================
-
-    try:
-
-        sws = SmartWebSocketV2(
-
-            auth_token,
-
-            API_KEY,
-
-            CLIENT_ID,
-
-            feed_token
-
-        )
-
-
-        sws.on_open = on_open
-
-        sws.on_data = on_data
-
-        sws.on_error = on_error
-
-        sws.on_close = on_close
-
-
-        print()
-
-        print(
-            "Connecting WebSocket..."
-        )
-
-
-        ws_thread = threading.Thread(
-
-            target=sws.connect,
-
-            daemon=True
-
-        )
-
-
-        ws_thread.start()
-
-
-        time.sleep(5)
-
-
-        strategy_loop()
-
-
-    except Exception as e:
-
-        print(
-            "WebSocket error:",
-            e
-        )
-
-
-    finally:
-
-        try:
-
-            save_completed_candles()
-
-        except Exception as e:
-
-            print(
-                "Final history save error:",
-                e
-            )
-
-
-        try:
-
-            if sws:
-
-                sws.close_connection()
-
-        except Exception:
-
-            pass
-
-
-        print()
-
-        print(
-            "=" * 80
-        )
-
-        print(
-            "SCANNER FINISHED"
-        )
-
-        print(
-            "IST:",
-            now_ist().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-        )
-
-        print(
-            "=" * 80
-        )
-
-
-# ============================================================
-# RUN
-# ============================================================
-
-if __name__ == "__main__":
-
-    main()
-
-PYTHON
-
-
-      # ============================================================
-      # VERIFY CREATED SCANNER
-      # ============================================================
-
+      # ==========================================================
+      # 8. VERIFY SCANNER
+      # ==========================================================
       - name: Verify Scanner
         run: |
 
-          echo "=============================================="
-          echo "VERIFY scanner.py"
-          echo "=============================================="
-
-          ls -lh scanner.py
+          echo "=========================================="
+          echo "VERIFYING scanner.py"
+          echo "=========================================="
 
           python -m py_compile scanner.py
 
-          echo "✅ scanner.py syntax OK"
+          echo "PYTHON COMPILE OK"
+
+          wc -l scanner.py
+
+          ls -lh scanner.py
 
 
-      # ============================================================
-      # RUN SCANNER
-      # ============================================================
-
+      # ==========================================================
+      # 9. RUN SCANNER
+      # ==========================================================
       - name: Run Scanner
-
         env:
-
           ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
           ANGEL_CLIENT_ID: ${{ secrets.ANGEL_CLIENT_ID }}
           ANGEL_PASSWORD: ${{ secrets.ANGEL_PASSWORD }}
@@ -2948,95 +2758,45 @@ PYTHON
 
         run: |
 
-          echo "=============================================="
-          echo "FUTURES OI + VWAP + ATM CE BUY SCANNER"
-          echo "=============================================="
-
-          echo ""
-
-          echo "UTC:"
-          date -u
-
-          echo ""
-
-          echo "System time:"
-          date
-
-          echo ""
-
-          echo "Python:"
-          python --version
-
-          echo ""
-
-          echo "Checking logzero:"
-          python -c "import logzero; print('LOGZERO OK BEFORE SCANNER')"
-
-          echo ""
-
-          echo "Checking SmartApi:"
-          python -c "from SmartApi import SmartConnect; print('SMARTAPI OK BEFORE SCANNER')"
-
-          echo ""
-
-          echo "Checking SmartWebSocketV2:"
-          python -c "from SmartApi.smartWebSocketV2 import SmartWebSocketV2; print('SMARTWEBSOCKETV2 OK BEFORE SCANNER')"
-
-          echo ""
+          echo "=========================================="
+          echo "STARTING FUTURES OI + VWAP + ATM CE SCANNER"
+          echo "=========================================="
 
           python scanner.py
 
 
-      # ============================================================
-      # UPLOAD SIGNALS
-      # ============================================================
-
-      - name: Upload Signals
-
+      # ==========================================================
+      # 10. UPLOAD SIGNAL FILE
+      # ==========================================================
+      - name: Upload BUY Signals
         if: always()
-
         uses: actions/upload-artifact@v4
-
         with:
-
-          name: futures-buy-signals
-
-          path: futures_buy_signals.csv
-
+          name: futures-buy-signals-${{ github.run_id }}
+          path: |
+            futures_buy_signals.csv
           if-no-files-found: ignore
 
 
-      # ============================================================
-      # UPLOAD VOLUME HISTORY
-      # ============================================================
-
+      # ==========================================================
+      # 11. UPLOAD VOLUME HISTORY
+      # ==========================================================
       - name: Upload Volume History
-
         if: always()
-
         uses: actions/upload-artifact@v4
-
         with:
-
-          name: futures-volume-history
-
-          path: data/volume_history.json
-
+          name: futures-volume-history-${{ github.run_id }}
+          path: |
+            data/volume_history.json
           if-no-files-found: ignore
 
 
-      # ============================================================
-      # SAVE VOLUME HISTORY
-      # ============================================================
-
-      - name: Save Volume History
-
+      # ==========================================================
+      # 12. SAVE CACHE
+      # ==========================================================
+      - name: Save Volume History Cache
         if: always()
-
         uses: actions/cache/save@v4
-
         with:
-
           path: data
-
           key: futures-volume-history-${{ github.run_id }}-${{ github.run_attempt }}
