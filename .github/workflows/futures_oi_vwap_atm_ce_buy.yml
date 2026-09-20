@@ -1,7 +1,6 @@
 name: FUTURES OI + VWAP + ATM CE BUY SCANNER
 
 on:
-
   schedule:
     # 09:15 IST = 03:45 UTC
     - cron: '45 3 * * 1-5'
