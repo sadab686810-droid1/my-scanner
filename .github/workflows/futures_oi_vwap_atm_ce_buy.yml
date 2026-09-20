@@ -58,27 +58,45 @@ jobs:
 
           python -m pip show logzero
 
-          python -c "import logzero; print('✅ LOGZERO OK')"
+          python -c "import logzero; print('LOGZERO OK')"
 
-          python -c "from SmartApi import SmartConnect; print('✅ SMARTAPI OK')"
+          python -c "from SmartApi import SmartConnect; print('SMARTAPI OK')"
+
+          python -c "from SmartApi.smartWebSocketV2 import SmartWebSocketV2; print('SMARTWEBSOCKETV2 OK')"
 
           echo "=============================================="
 
 
       # ============================================================
-      # RESTORE 20D VOLUME HISTORY
+      # RESTORE VOLUME HISTORY
       # ============================================================
 
       - name: Restore Volume History
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
 
           path: data
 
-          key: futures-volume-history-${{ github.run_id }}
+          key: futures-volume-history-${{ github.run_id }}-${{ github.run_attempt }}
 
           restore-keys: |
             futures-volume-history-
+
+
+      # ============================================================
+      # CREATE DATA DIRECTORY
+      # ============================================================
+
+      - name: Prepare Data Directory
+        run: |
+
+          mkdir -p data
+
+          echo "=============================================="
+          echo "DATA DIRECTORY"
+          echo "=============================================="
+
+          ls -la data || true
 
 
       # ============================================================
@@ -86,19 +104,7 @@ jobs:
       # ============================================================
 
       - name: Create Scanner
-        env:
-
-          ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
-          ANGEL_CLIENT_ID: ${{ secrets.ANGEL_CLIENT_ID }}
-          ANGEL_PASSWORD: ${{ secrets.ANGEL_PASSWORD }}
-          ANGEL_TOTP: ${{ secrets.ANGEL_TOTP }}
-
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
         run: |
-
-          mkdir -p data
 
           cat > scanner.py <<'PYTHON'
 
@@ -214,17 +220,36 @@ LOCK = threading.Lock()
 
 
 # ============================================================
+# SAFE FLOAT
+# ============================================================
+
+def safe_float(value, default=0.0):
+
+    try:
+
+        return float(value)
+
+    except Exception:
+
+        return default
+
+
+# ============================================================
 # TELEGRAM
 # ============================================================
 
 def send_telegram(message):
 
     if not TELEGRAM_BOT_TOKEN:
-        print("⚠️ TELEGRAM_BOT_TOKEN missing")
+
+        print("TELEGRAM_BOT_TOKEN missing")
+
         return
 
     if not TELEGRAM_CHAT_ID:
-        print("⚠️ TELEGRAM_CHAT_ID missing")
+
+        print("TELEGRAM_CHAT_ID missing")
+
         return
 
     url = (
@@ -245,11 +270,13 @@ def send_telegram(message):
         )
 
         if r.ok:
-            print("📲 Telegram sent")
+
+            print("Telegram sent")
 
         else:
+
             print(
-                "❌ Telegram error:",
+                "Telegram error:",
                 r.status_code,
                 r.text
             )
@@ -257,7 +284,7 @@ def send_telegram(message):
     except Exception as e:
 
         print(
-            "❌ Telegram exception:",
+            "Telegram exception:",
             e
         )
 
@@ -269,6 +296,7 @@ def send_telegram(message):
 def load_history():
 
     if not os.path.exists(HISTORY_FILE):
+
         return {}
 
     try:
@@ -281,7 +309,12 @@ def load_history():
 
             return json.load(f)
 
-    except Exception:
+    except Exception as e:
+
+        print(
+            "History load error:",
+            e
+        )
 
         return {}
 
@@ -326,33 +359,73 @@ def download_master():
     )
 
     print(
-        "📥 Downloading Angel One Scrip Master..."
+        "Downloading Angel One Scrip Master..."
     )
 
-    r = requests.get(
-        url,
-        timeout=120
+    last_error = None
+
+    for attempt in range(1, 4):
+
+        try:
+
+            print(
+                f"Master download attempt {attempt}/3"
+            )
+
+            r = requests.get(
+                url,
+                timeout=120
+            )
+
+            r.raise_for_status()
+
+            data = r.json()
+
+            if not isinstance(data, list):
+
+                raise ValueError(
+                    "Scrip master is not a list"
+                )
+
+            if len(data) < 10000:
+
+                raise ValueError(
+                    f"Scrip master too small: {len(data)}"
+                )
+
+            print(
+                "Scrip Master loaded:",
+                len(data)
+            )
+
+            return data
+
+        except Exception as e:
+
+            last_error = e
+
+            print(
+                "Master download error:",
+                e
+            )
+
+            if attempt < 3:
+
+                time.sleep(5)
+
+    raise RuntimeError(
+        f"Scrip master download failed: {last_error}"
     )
-
-    r.raise_for_status()
-
-    data = r.json()
-
-    print(
-        "✅ Scrip Master loaded:",
-        len(data)
-    )
-
-    return data
 
 
 # ============================================================
-# EXPIRY PARSER
+# EXPIRY
 # ============================================================
 
 def expiry_value(value):
 
     if not value:
+
         return None
 
     try:
@@ -383,14 +456,16 @@ def expiry_value(value):
 def strike_value(value):
 
     try:
+
         return float(value)
 
     except Exception:
+
         return 0.0
 
 
 # ============================================================
-# BUILD CONTRACT MAP
+# BUILD CONTRACTS
 # ============================================================
 
 def build_contracts():
@@ -405,6 +480,7 @@ def build_contracts():
     FUTURES = {}
     OPTIONS = {}
     SPOTS = {}
+
     NIFTY_FUTURE = None
 
     for row in MASTER:
@@ -534,13 +610,17 @@ def build_contracts():
             upper_symbol = symbol.upper()
 
             if upper_symbol.endswith("CE"):
+
                 option_type = "CE"
 
             elif upper_symbol.endswith("PE"):
+
                 option_type = "PE"
 
             else:
+
                 option_type = ""
+
 
             if option_type:
 
@@ -565,7 +645,7 @@ def build_contracts():
 
 
     # ========================================================
-    # NEAREST FUTURE
+    # NEAREST STOCK FUTURE
     # ========================================================
 
     for name in list(FUTURES.keys()):
@@ -580,7 +660,7 @@ def build_contracts():
 
 
     # ========================================================
-    # OPTIONS SORT
+    # SORT OPTIONS
     # ========================================================
 
     for name in list(OPTIONS.keys()):
@@ -594,18 +674,19 @@ def build_contracts():
 
 
     print()
+
     print(
-        "📊 Spot symbols:",
+        "Spot symbols:",
         len(SPOTS)
     )
 
     print(
-        "📊 Futures symbols:",
+        "Futures symbols:",
         len(FUTURES)
     )
 
     print(
-        "📊 Options symbols:",
+        "Options symbols:",
         len(OPTIONS)
     )
 
@@ -613,7 +694,7 @@ def build_contracts():
     if NIFTY_FUTURE:
 
         print(
-            "📌 NIFTY FUTURE:",
+            "NIFTY FUTURE:",
             NIFTY_FUTURE["symbol"],
             NIFTY_FUTURE["token"]
         )
@@ -621,7 +702,7 @@ def build_contracts():
     else:
 
         print(
-            "❌ NIFTY FUTURE NOT FOUND"
+            "NIFTY FUTURE NOT FOUND"
         )
 
 
@@ -640,6 +721,7 @@ def find_atm_ce(
     )
 
     if not contracts:
+
         return None
 
     today = now_ist().date()
@@ -659,6 +741,7 @@ def find_atm_ce(
     ]
 
     if not valid:
+
         return None
 
     nearest_expiry = min(
@@ -690,7 +773,7 @@ def find_atm_ce(
 
 
 # ============================================================
-# FUTURES PRICE CHANGE
+# PRICE CHANGE
 # ============================================================
 
 def price_change(item):
@@ -706,6 +789,7 @@ def price_change(item):
     )
 
     if close <= 0:
+
         return None
 
     return (
@@ -757,7 +841,7 @@ def oi_change_percent(item):
 
 
 # ============================================================
-# DEPTH HELPERS
+# DEPTH
 # ============================================================
 
 def best_buy(item):
@@ -768,18 +852,19 @@ def best_buy(item):
     )
 
     if not arr:
+
         return 0, 0
 
     x = arr[0]
 
     return (
-        float(
+        safe_float(
             x.get(
                 "quantity",
                 0
             )
         ),
-        float(
+        safe_float(
             x.get(
                 "price",
                 0
@@ -796,18 +881,19 @@ def best_sell(item):
     )
 
     if not arr:
+
         return 0, 0
 
     x = arr[0]
 
     return (
-        float(
+        safe_float(
             x.get(
                 "quantity",
                 0
             )
         ),
-        float(
+        safe_float(
             x.get(
                 "price",
                 0
@@ -840,6 +926,7 @@ def update_candle(
     )
 
     if not ts:
+
         return
 
     minute = (
@@ -938,11 +1025,12 @@ def save_completed_candles():
 
         for key, c in candles.items():
 
-            # Do not save current incomplete candle
             if key == current_minute:
+
                 continue
 
             if c["date"] != today:
+
                 continue
 
             volume = max(
@@ -977,9 +1065,7 @@ def save_completed_candles():
 
             if len(dates) > 25:
 
-                old_dates = dates[:-25]
-
-                for d in old_dates:
+                for d in dates[:-25]:
 
                     del HISTORY[name][slot][d]
 
@@ -1018,13 +1104,14 @@ def volume_20d_average(
     ]
 
     if len(values) < REQUIRED_HISTORY_DAYS:
+
         return None
 
     return sum(values) / len(values)
 
 
 # ============================================================
-# UPDATE LIVE TICK
+# PROCESS TICK
 # ============================================================
 
 def process_tick(
@@ -1041,23 +1128,26 @@ def process_tick(
         )
 
         if not instrument:
+
             return
 
         name = instrument["name"]
+
         kind = instrument["kind"]
 
 
-        ltp_raw = message.get(
-            "last_traded_price",
-            0
+        ltp = (
+            safe_float(
+                message.get(
+                    "last_traded_price",
+                    0
+                )
+            )
+            / 100
         )
 
-        ltp = float(
-            ltp_raw
-        ) / 100
 
-
-        volume = float(
+        volume = safe_float(
             message.get(
                 "volume_trade_for_the_day",
                 0
@@ -1065,7 +1155,7 @@ def process_tick(
         )
 
 
-        oi = float(
+        oi = safe_float(
             message.get(
                 "open_interest",
                 0
@@ -1073,42 +1163,56 @@ def process_tick(
         )
 
 
-        close = float(
-            message.get(
-                "closed_price",
-                0
+        close = (
+            safe_float(
+                message.get(
+                    "closed_price",
+                    0
+                )
             )
-        ) / 100
-
-
-        avg_price = float(
-            message.get(
-                "average_traded_price",
-                0
-            )
-        ) / 100
-
-
-        exchange_timestamp = message.get(
-            "exchange_timestamp",
-            0
+            / 100
         )
 
 
-        if exchange_timestamp:
-
-            ts = (
-                float(
-                    exchange_timestamp
-                ) / 1000
+        avg_price = (
+            safe_float(
+                message.get(
+                    "average_traded_price",
+                    0
+                )
             )
+            / 100
+        )
+
+
+        raw_ts = (
+            message.get(
+                "exchange_timestamp"
+            )
+            or
+            message.get(
+                "last_traded_timestamp"
+            )
+        )
+
+
+        if raw_ts:
+
+            raw_ts = safe_float(
+                raw_ts
+            )
+
+            if raw_ts > 100_000_000_000:
+
+                ts = raw_ts / 1000
+
+            else:
+
+                ts = raw_ts
 
         else:
 
-            ts = (
-                now_ist()
-                .timestamp()
-            )
+            ts = now_ist().timestamp()
 
 
         old = LIVE.get(
@@ -1128,10 +1232,10 @@ def process_tick(
             )
 
 
-        # SmartAPI OI change field
         api_oi_change = message.get(
             "open_interest_change_percentage"
         )
+
 
         try:
 
@@ -1211,7 +1315,7 @@ def process_tick(
     except Exception as e:
 
         print(
-            "⚠️ Tick error:",
+            "Tick error:",
             e
         )
 
@@ -1244,6 +1348,7 @@ def build_watchlist():
     for name, contracts in FUTURES.items():
 
         if not contracts:
+
             continue
 
         future = contracts[0]
@@ -1257,6 +1362,7 @@ def build_watchlist():
         )
 
         if not spot:
+
             continue
 
         spot_token = str(
@@ -1283,7 +1389,7 @@ def build_watchlist():
     print()
 
     print(
-        "📡 Initial subscriptions:"
+        "Initial subscriptions:"
     )
 
     print(
@@ -1314,20 +1420,26 @@ def select_candidates():
 
 
     if not nf:
+
         return []
 
 
     # NIFTY FUTURE > VWAP
+
     if nf["vwap"] <= 0:
+
         return []
 
+
     if nf["ltp"] <= nf["vwap"]:
+
         return []
 
 
     for name, contracts in FUTURES.items():
 
         if not contracts:
+
             continue
 
 
@@ -1343,6 +1455,7 @@ def select_candidates():
         )
 
         if not spot:
+
             continue
 
 
@@ -1361,6 +1474,7 @@ def select_candidates():
 
 
         if not f or not s:
+
             continue
 
 
@@ -1374,9 +1488,12 @@ def select_candidates():
 
 
         if pc is None:
+
             continue
 
+
         if oi_pc is None:
+
             continue
 
 
@@ -1384,34 +1501,47 @@ def select_candidates():
 
 
         # Futures price > +1.5%
+
         if pc <= FUTURES_PRICE_CHANGE_MIN:
+
             continue
 
 
         # OI change > +2%
+
         if oi_pc <= FUTURES_OI_CHANGE_MIN:
+
             continue
 
 
         # Current OI > 3 Cr
+
         if current_oi <= FUTURES_MIN_OI:
+
             continue
 
 
         # Long buildup
+
         if pc <= 0 or oi_pc <= 0:
+
             continue
 
 
-        # Stock spot > VWAP
+        # Spot > VWAP
+
         if s["vwap"] <= 0:
+
             continue
+
 
         if s["ltp"] <= s["vwap"]:
+
             continue
 
 
         # ATM CE
+
         ce = find_atm_ce(
             name,
             s["ltp"]
@@ -1419,6 +1549,7 @@ def select_candidates():
 
 
         if not ce:
+
             continue
 
 
@@ -1455,6 +1586,11 @@ def subscribe_options(
     candidates
 ):
 
+    if not sws:
+
+        return
+
+
     new_tokens = []
 
 
@@ -1481,13 +1617,14 @@ def subscribe_options(
 
 
     if not new_tokens:
+
         return
 
 
     print()
 
     print(
-        "🟡 NEW OPTION WATCHLIST:"
+        "NEW OPTION WATCHLIST:"
     )
 
 
@@ -1497,18 +1634,15 @@ def subscribe_options(
             c["ce_token"]
         )
 
+
         if token in new_tokens:
 
             print(
 
                 c["name"],
-
                 "ATM CE:",
-
                 c["ce"]["symbol"],
-
                 "TOKEN:",
-
                 token
 
             )
@@ -1545,7 +1679,7 @@ def subscribe_options(
 
 
         print(
-            "✅ ATM CE subscription sent:",
+            "ATM CE subscription sent:",
             len(new_tokens)
         )
 
@@ -1553,7 +1687,7 @@ def subscribe_options(
     except Exception as e:
 
         print(
-            "❌ Option subscribe error:",
+            "Option subscribe error:",
             e
         )
 
@@ -1575,14 +1709,14 @@ def check_final_signals():
     if not candidates:
 
         print(
-            "⏳ No stock passed futures/market/spot filters"
+            "No stock passed futures/market/spot filters"
         )
 
         return
 
 
     print(
-        "🟡 Candidates:",
+        "Candidates:",
         len(candidates)
     )
 
@@ -1611,11 +1745,12 @@ def check_final_signals():
 
 
         if not option:
+
             continue
 
 
         # ========================================================
-        # OPTION BUY / SELL
+        # OPTION BUY / SELL RATIO
         # ========================================================
 
         buy_qty, buy_price = best_buy(
@@ -1628,9 +1763,12 @@ def check_final_signals():
 
 
         if sell_qty <= 0:
+
             continue
 
+
         if buy_qty <= 0:
+
             continue
 
 
@@ -1644,7 +1782,7 @@ def check_final_signals():
 
             print(
 
-                f"❌ {name} CE Bid/Ask "
+                f"{name} CE Bid/Ask "
                 f"{ratio:.2f}x < 1.8x"
 
             )
@@ -1680,10 +1818,14 @@ def check_final_signals():
         for key, candle in candles.items():
 
             if key == current_minute:
+
                 continue
 
+
             if candle["date"] != today:
+
                 continue
+
 
             completed.append(
                 candle
@@ -1691,8 +1833,7 @@ def check_final_signals():
 
 
         completed.sort(
-            key=lambda x:
-            x["slot"]
+            key=lambda x: x["slot"]
         )
 
 
@@ -1702,7 +1843,7 @@ def check_final_signals():
         if len(completed) < 3:
 
             print(
-                f"⏳ {name}: less than 3 candles"
+                f"{name}: less than 3 completed candles"
             )
 
             continue
@@ -1723,7 +1864,7 @@ def check_final_signals():
 
             print(
 
-                f"❌ {name}: "
+                f"{name}: "
                 f"green candles "
                 f"{green_count}/3"
 
@@ -1811,7 +1952,7 @@ def check_final_signals():
         if not volume_ok:
 
             print(
-                f"❌ {name}: 20D volume failed"
+                f"{name}: 20D volume failed"
             )
 
             continue
@@ -1860,45 +2001,45 @@ def check_final_signals():
         )
 
 
+        if not nifty_live:
+
+            continue
+
+
         message = (
 
             "🟢 FINAL BUY ALERT\n\n"
 
-            f"📌 STOCK: {name}\n"
+            f"STOCK: {name}\n"
+            f"SPOT: ₹{spot['ltp']:.2f}\n\n"
 
-            f"💰 SPOT: ₹"
-            f"{spot['ltp']:.2f}\n\n"
+            "STOCK FUTURES\n"
 
-            "📊 STOCK FUTURES\n"
+            f"Price Change: +{pc:.2f}%\n"
 
-            f"Price Change: "
-            f"+{pc:.2f}%\n"
-
-            f"OI Change: "
-            f"+{oi_pc:.2f}%\n"
+            f"OI Change: +{oi_pc:.2f}%\n"
 
             f"Current OI: "
             f"{future['oi']/10000000:.2f} Cr\n"
 
             "Long Buildup: YES\n\n"
 
-            "📈 MARKET\n"
+            "MARKET\n"
 
             f"NIFTY FUTURE: "
             f"₹{nifty_live['ltp']:.2f}\n"
 
-            f"NIFTY VWAP: "
+            f"NIFTY AVG/VWAP: "
             f"₹{nifty_live['vwap']:.2f}\n\n"
 
-            "📈 STOCK\n"
+            "STOCK\n"
 
-            f"Spot VWAP: "
+            f"Spot AVG/VWAP: "
             f"₹{spot['vwap']:.2f}\n\n"
 
-            "🟢 OPTION\n"
+            "OPTION\n"
 
-            f"ATM CE: "
-            f"{ce['symbol']}\n"
+            f"ATM CE: {ce['symbol']}\n"
 
             f"CE Bid Qty: "
             f"{buy_qty:.0f}\n"
@@ -1909,14 +2050,14 @@ def check_final_signals():
             f"Bid/Ask Qty: "
             f"{ratio:.2f}x\n\n"
 
-            "🕯 PRICE ACTION\n"
+            "PRICE ACTION\n"
 
             f"Last 3 candles green: "
             f"{green_count}/3\n"
 
             "20D Volume: PASS\n\n"
 
-            f"⏰ "
+            f"TIME: "
             f"{now_ist().strftime('%H:%M:%S')} IST"
 
         )
@@ -2012,6 +2153,11 @@ def save_signal(
         )
 
 
+        if not option:
+
+            return
+
+
         bid_qty, _ = best_buy(
             option
         )
@@ -2073,6 +2219,7 @@ def on_data(
 
 
     if not token:
+
         return
 
 
@@ -2093,8 +2240,12 @@ def on_open(
     print()
 
     print(
-        "🟢 WebSocket connected"
+        "WebSocket connected"
     )
+
+
+    # New connection = fresh subscription state
+    SUBSCRIBED_OPTION_TOKENS.clear()
 
 
     token_list = []
@@ -2113,7 +2264,6 @@ def on_open(
             nse_fo_tokens.append(
                 token
             )
-
 
         elif info["kind"] == "SPOT":
 
@@ -2146,6 +2296,15 @@ def on_open(
         })
 
 
+    if not token_list:
+
+        print(
+            "No initial tokens to subscribe"
+        )
+
+        return
+
+
     try:
 
         sws.subscribe(
@@ -2160,16 +2319,16 @@ def on_open(
 
 
         print(
-            "✅ Futures + Spot subscription sent"
+            "Futures + Spot subscription sent"
         )
 
         print(
-            "📡 Spot tokens:",
+            "Spot tokens:",
             len(nse_cm_tokens)
         )
 
         print(
-            "📡 Futures tokens:",
+            "Futures tokens:",
             len(nse_fo_tokens)
         )
 
@@ -2177,7 +2336,7 @@ def on_open(
     except Exception as e:
 
         print(
-            "❌ Subscription error:",
+            "Subscription error:",
             e
         )
 
@@ -2192,7 +2351,7 @@ def on_error(
 ):
 
     print(
-        "❌ WebSocket error:",
+        "WebSocket error:",
         error
     )
 
@@ -2206,7 +2365,7 @@ def on_close(
 ):
 
     print(
-        "🔴 WebSocket closed"
+        "WebSocket closed"
     )
 
 
@@ -2221,11 +2380,10 @@ def strategy_loop():
 
     while True:
 
-
         if market_time() >= END_TIME:
 
             print(
-                "🛑 15:00 IST reached."
+                "15:00 IST reached."
             )
 
 
@@ -2256,7 +2414,7 @@ def strategy_loop():
             except Exception as e:
 
                 print(
-                    "⚠️ History save error:",
+                    "History save error:",
                     e
                 )
 
@@ -2264,7 +2422,7 @@ def strategy_loop():
             print()
 
             print(
-                "🔎 Running strategy scan:",
+                "Running strategy scan:",
                 now_ist().strftime(
                     "%H:%M:%S"
                 )
@@ -2278,7 +2436,7 @@ def strategy_loop():
             except Exception as e:
 
                 print(
-                    "⚠️ Strategy error:",
+                    "Strategy error:",
                     e
                 )
 
@@ -2304,7 +2462,7 @@ def main():
     )
 
     print(
-        "🚀 FUTURES + OI + VWAP + ATM CE BUY SCANNER"
+        "FUTURES OI + VWAP + ATM CE BUY SCANNER"
     )
 
     print(
@@ -2314,7 +2472,7 @@ def main():
     print()
 
     print(
-        "TIME: 09:15 → 15:00 IST"
+        "TIME: 09:15 -> 15:00 IST"
     )
 
     print(
@@ -2377,7 +2535,6 @@ def main():
         )
     )
 
-
     print()
 
 
@@ -2385,37 +2542,42 @@ def main():
     # SECRET CHECK
     # ========================================================
 
+    missing = []
+
+
     if not API_KEY:
 
-        print(
-            "❌ ANGEL_API_KEY missing"
+        missing.append(
+            "ANGEL_API_KEY"
         )
-
-        return
 
 
     if not CLIENT_ID:
 
-        print(
-            "❌ ANGEL_CLIENT_ID missing"
+        missing.append(
+            "ANGEL_CLIENT_ID"
         )
-
-        return
 
 
     if not PASSWORD:
 
-        print(
-            "❌ ANGEL_PASSWORD missing"
+        missing.append(
+            "ANGEL_PASSWORD"
         )
-
-        return
 
 
     if not TOTP_SECRET:
 
+        missing.append(
+            "ANGEL_TOTP"
+        )
+
+
+    if missing:
+
         print(
-            "❌ ANGEL_TOTP missing"
+            "Missing Angel secrets:",
+            ", ".join(missing)
         )
 
         return
@@ -2424,26 +2586,26 @@ def main():
     if TELEGRAM_BOT_TOKEN:
 
         print(
-            "✅ TELEGRAM_BOT_TOKEN loaded"
+            "TELEGRAM_BOT_TOKEN loaded"
         )
 
     else:
 
         print(
-            "❌ TELEGRAM_BOT_TOKEN missing"
+            "TELEGRAM_BOT_TOKEN missing"
         )
 
 
     if TELEGRAM_CHAT_ID:
 
         print(
-            "✅ TELEGRAM_CHAT_ID loaded"
+            "TELEGRAM_CHAT_ID loaded"
         )
 
     else:
 
         print(
-            "❌ TELEGRAM_CHAT_ID missing"
+            "TELEGRAM_CHAT_ID missing"
         )
 
 
@@ -2455,7 +2617,7 @@ def main():
 
         print(
 
-            "⏳ Waiting for 09:15 IST...",
+            "Waiting for 09:15 IST...",
 
             now_ist().strftime(
                 "%H:%M:%S"
@@ -2469,7 +2631,7 @@ def main():
     if market_time() >= END_TIME:
 
         print(
-            "🛑 Market window finished."
+            "Market window finished."
         )
 
         return
@@ -2482,7 +2644,7 @@ def main():
     print()
 
     print(
-        "🔐 Logging into Angel One..."
+        "Logging into Angel One..."
     )
 
 
@@ -2512,7 +2674,7 @@ def main():
         if not session:
 
             print(
-                "❌ Login failed"
+                "Login failed"
             )
 
             return
@@ -2524,7 +2686,7 @@ def main():
         ):
 
             print(
-                "❌ Angel login failed:",
+                "Angel login failed:",
                 session
             )
 
@@ -2544,14 +2706,14 @@ def main():
 
 
         print(
-            "✅ Angel login SUCCESS"
+            "Angel login SUCCESS"
         )
 
 
     except Exception as e:
 
         print(
-            "❌ Login error:",
+            "Login error:",
             e
         )
 
@@ -2574,7 +2736,7 @@ def main():
     except Exception as e:
 
         print(
-            "❌ Master error:",
+            "Master error:",
             e
         )
 
@@ -2584,7 +2746,7 @@ def main():
     if not NIFTY_FUTURE:
 
         print(
-            "❌ NIFTY FUTURE not found."
+            "NIFTY FUTURE not found."
         )
 
         return
@@ -2593,7 +2755,7 @@ def main():
     if not FUTURES:
 
         print(
-            "❌ Stock futures not found."
+            "Stock futures not found."
         )
 
         return
@@ -2627,7 +2789,7 @@ def main():
 
         "Volume > 20D same-slot average\n\n"
 
-        "⏰ 09:15 → 15:00 IST"
+        "09:15 -> 15:00 IST"
 
     )
 
@@ -2663,7 +2825,7 @@ def main():
         print()
 
         print(
-            "🚀 Connecting WebSocket..."
+            "Connecting WebSocket..."
         )
 
 
@@ -2688,7 +2850,7 @@ def main():
     except Exception as e:
 
         print(
-            "❌ WebSocket error:",
+            "WebSocket error:",
             e
         )
 
@@ -2698,6 +2860,20 @@ def main():
         try:
 
             save_completed_candles()
+
+        except Exception as e:
+
+            print(
+                "Final history save error:",
+                e
+            )
+
+
+        try:
+
+            if sws:
+
+                sws.close_connection()
 
         except Exception:
 
@@ -2711,7 +2887,7 @@ def main():
         )
 
         print(
-            "🛑 SCANNER FINISHED"
+            "SCANNER FINISHED"
         )
 
         print(
@@ -2738,6 +2914,24 @@ PYTHON
 
 
       # ============================================================
+      # VERIFY CREATED SCANNER
+      # ============================================================
+
+      - name: Verify Scanner
+        run: |
+
+          echo "=============================================="
+          echo "VERIFY scanner.py"
+          echo "=============================================="
+
+          ls -lh scanner.py
+
+          python -m py_compile scanner.py
+
+          echo "✅ scanner.py syntax OK"
+
+
+      # ============================================================
       # RUN SCANNER
       # ============================================================
 
@@ -2756,7 +2950,7 @@ PYTHON
         run: |
 
           echo "=============================================="
-          echo "🚀 FUTURES OI + VWAP + ATM CE BUY SCANNER"
+          echo "FUTURES OI + VWAP + ATM CE BUY SCANNER"
           echo "=============================================="
 
           echo ""
@@ -2777,12 +2971,17 @@ PYTHON
           echo ""
 
           echo "Checking logzero:"
-          python -c "import logzero; print('✅ LOGZERO OK BEFORE SCANNER')"
+          python -c "import logzero; print('LOGZERO OK BEFORE SCANNER')"
 
           echo ""
 
           echo "Checking SmartApi:"
-          python -c "from SmartApi import SmartConnect; print('✅ SMARTAPI OK BEFORE SCANNER')"
+          python -c "from SmartApi import SmartConnect; print('SMARTAPI OK BEFORE SCANNER')"
+
+          echo ""
+
+          echo "Checking SmartWebSocketV2:"
+          python -c "from SmartApi.smartWebSocketV2 import SmartWebSocketV2; print('SMARTWEBSOCKETV2 OK BEFORE SCANNER')"
 
           echo ""
 
@@ -2809,6 +3008,25 @@ PYTHON
 
 
       # ============================================================
+      # UPLOAD VOLUME HISTORY
+      # ============================================================
+
+      - name: Upload Volume History
+
+        if: always()
+
+        uses: actions/upload-artifact@v4
+
+        with:
+
+          name: futures-volume-history
+
+          path: data/volume_history.json
+
+          if-no-files-found: ignore
+
+
+      # ============================================================
       # SAVE VOLUME HISTORY
       # ============================================================
 
@@ -2822,4 +3040,4 @@ PYTHON
 
           path: data
 
-          key: futures-volume-history-${{ github.run_id }}
+          key: futures-volume-history-${{ github.run_id }}-${{ github.run_attempt }}
