@@ -55,9 +55,8 @@ jobs:
           ANGEL_PASSWORD: ${{ secrets.ANGEL_PASSWORD }}
           ANGEL_TOTP: ${{ secrets.ANGEL_TOTP }}
 
-          TELE_TOKEN: ${{ secrets.TELE_TOKEN }}
-          TELE_CHAT_ID: ${{ secrets.TELE_CHAT_ID }}
-
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN}}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID}}
         run: |
 
           cat > scanner.py <<'PYTHON'
@@ -105,8 +104,8 @@ jobs:
           # TELEGRAM
           # ============================================================
 
-          TELE_TOKEN = os.getenv("TELE_TOKEN")
-          TELE_CHAT_ID = os.getenv("TELE_CHAT_ID")
+          TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+          TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
           # ============================================================
@@ -204,21 +203,21 @@ jobs:
 
           def send_telegram(message):
 
-              if not TELE_TOKEN:
-                  print("⚠️ TELE_TOKEN missing")
+              if not TELEGRAM_BOT_TOKEN:
+                  print("⚠️ TELEGRAM_BOT_TOKEN missing")
                   return
 
-              if not TELE_CHAT_ID:
-                  print("⚠️ TELE_CHAT_ID missing")
+              if not TELEGRAM_CHAT_ID:
+                  print("⚠️ TELEGRAM_CHAT_ID missing")
                   return
 
               url = (
                   f"https://api.telegram.org/bot"
-                  f"{TELE_TOKEN}/sendMessage"
+                  f"{TELEGRAM_BOT_TOKEN}/sendMessage"
               )
 
               payload = {
-                  "chat_id": TELE_CHAT_ID,
+                  "chat_id": TELEGRAM_CHAT_ID,
                   "text": message
               }
 
