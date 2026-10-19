@@ -27,10 +27,11 @@ jobs:
         with:
           python-version: "3.12"
 
+     
       - name: Install libraries
         run: |
           python -m pip install --upgrade pip
-          python -m pip install smartapi-python pyotp requests logzero
+          python -m pip install smartapi-python pyotp requests logzero websocket-client
 
       - name: Create and run complete scanner
         env:
