@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: nse-fno-breakout-scanner
+  group: nse-fno-breakout
   cancel-in-progress: false
 
 jobs:
@@ -21,26 +21,18 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install Python libraries
+      - name: Install libraries
         run: |
           python -m pip install --upgrade pip
-          python -m pip install smartapi-python pyotp requests
+          python -m pip install smartapi-python pyotp requests logzero
 
-      - name: Initialize scanner state
-        run: |
-          if [ ! -f scanner_state.json ]; then
-            echo '{"date":"","last_processed":{}}' > scanner_state.json
-          fi
-
-      - name: Run scanner
+      - name: Create and run complete scanner
         env:
           ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
           ANGEL_CLIENT_ID: ${{ secrets.ANGEL_CLIENT_ID }}
@@ -48,9 +40,237 @@ jobs:
           ANGEL_TOTP: ${{ secrets.ANGEL_TOTP }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python scanner.py
+        run: |
+          cat > scanner_runtime.py <<'PYTHON'
+          import os
+          import json
+          import time
+          import requests
+          from datetime import datetime, time as clock_time
+          from zoneinfo import ZoneInfo
+          import pyotp
+          from SmartApi import SmartConnect
 
-      - name: Save scanner state
+          IST = ZoneInfo("Asia/Kolkata")
+          MASTER_URL = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
+          STATE_FILE = "scanner_state.json"
+          BODY_MIN = 75.0
+
+          def log(msg):
+              print(f"[{datetime.now(IST):%H:%M:%S}] {msg}", flush=True)
+
+          def telegram(msg):
+              r = requests.post(
+                  f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage",
+                  data={
+                      "chat_id": os.environ["TELEGRAM_CHAT_ID"],
+                      "text": msg
+                  },
+                  timeout=20
+              )
+              r.raise_for_status()
+              if not r.json().get("ok"):
+                  raise RuntimeError("Telegram send failed")
+
+          def login():
+              otp = os.environ["ANGEL_TOTP"].strip()
+              if not (len(otp) == 6 and otp.isdigit()):
+                  otp = pyotp.TOTP(otp).now()
+              api = SmartConnect(api_key=os.environ["ANGEL_API_KEY"])
+              result = api.generateSession(
+                  os.environ["ANGEL_CLIENT_ID"],
+                  os.environ["ANGEL_PASSWORD"],
+                  otp
+              )
+              if not result or not result.get("status"):
+                  raise RuntimeError(f"Angel login failed: {result}")
+              log("Angel One login successful")
+              return api
+
+          def get_stocks():
+              r = requests.get(MASTER_URL, timeout=90)
+              r.raise_for_status()
+              master = r.json()
+              names = {
+                  str(x.get("name", "")).strip().upper()
+                  for x in master
+                  if x.get("exch_seg") == "NFO"
+                  and x.get("instrumenttype") == "FUTSTK"
+                  and x.get("name")
+              }
+              stocks = {}
+              for x in master:
+                  symbol = str(x.get("symbol", "")).strip()
+                  token = str(x.get("token", "")).strip()
+                  if x.get("exch_seg") != "NSE" or not symbol.endswith("-EQ"):
+                      continue
+                  name = symbol[:-3].upper()
+                  if name in names and token:
+                      stocks[name] = {"symbol": symbol, "token": token}
+              if not stocks:
+                  raise RuntimeError("No NSE F&O stocks mapped")
+              log(f"Mapped F&O stocks: {len(stocks)}")
+              return stocks
+
+          def read_state(today):
+              try:
+                  with open(STATE_FILE, encoding="utf-8") as f:
+                      s = json.load(f)
+                  if s.get("date") == today:
+                      s.setdefault("opening_high", {})
+                      s.setdefault("last_processed", {})
+                      s.setdefault("invalid_open", [])
+                      return s
+              except (OSError, ValueError):
+                  pass
+              return {
+                  "date": today,
+                  "opening_high": {},
+                  "last_processed": {},
+                  "invalid_open": []
+              }
+
+          def save_state(state):
+              temp = STATE_FILE + ".tmp"
+              with open(temp, "w", encoding="utf-8") as f:
+                  json.dump(state, f)
+              os.replace(temp, STATE_FILE)
+
+          def get_candles(api, token, today, now):
+              result = api.getCandleData({
+                  "exchange": "NSE",
+                  "symboltoken": str(token),
+                  "interval": "FIVE_MINUTE",
+                  "fromdate": f"{today} 09:15",
+                  "todate": now.strftime("%Y-%m-%d %H:%M")
+              })
+              if not result or not result.get("status"):
+                  log(f"Candle request failed for token {token}: {result}")
+                  return None
+              return result.get("data") or []
+
+          def stamp(c):
+              return datetime.fromisoformat(str(c[0])).astimezone(IST)
+
+          def complete(c, now):
+              try:
+                  return stamp(c).timestamp() + 300 <= now.timestamp()
+              except (ValueError, TypeError, IndexError):
+                  return False
+
+          def valid_opening(c):
+              try:
+                  o, h, l, close = map(float, c[1:5])
+                  rng = h - l
+                  if rng <= 0:
+                      return False
+                  body = abs(close - o) / rng * 100
+                  return close > o and body >= BODY_MIN
+              except (ValueError, TypeError, IndexError):
+                  return False
+
+          def scan_one(api, name, stock, state, today, now):
+              candles = get_candles(api, stock["token"], today, now)
+              if candles is None:
+                  return
+              candles = sorted(
+                  [c for c in candles if complete(c, now)],
+                  key=lambda c: c[0]
+              )
+              if not candles:
+                  return
+
+              opening = next(
+                  (c for c in candles if stamp(c).strftime("%H:%M") == "09:15"),
+                  None
+              )
+              if opening is None:
+                  return
+
+              if name in state["invalid_open"]:
+                  return
+
+              if name not in state["opening_high"]:
+                  if not valid_opening(opening):
+                      state["invalid_open"].append(name)
+                      state["last_processed"][name] = candles[-1][0]
+                      return
+                  state["opening_high"][name] = float(opening[2])
+                  log(f"{stock['symbol']} opening high: {opening[2]}")
+
+              high = float(state["opening_high"][name])
+              last = state["last_processed"].get(name)
+
+              for i, c in enumerate(candles):
+                  cid = c[0]
+                  if cid == opening[0] or (last and cid <= last):
+                      continue
+                  if i == 0:
+                      continue
+
+                  previous = candles[i - 1]
+                  close = float(c[4])
+                  volume = float(c[5])
+                  previous_volume = float(previous[5])
+
+                  if close > high and volume > previous_volume:
+                      message = (
+                          "🟢 NSE F&O BREAKOUT BUY\n"
+                          "━━━━━━━━━━━━━━━━━━\n"
+                          f"📌 STOCK: {stock['symbol']}\n"
+                          f"⏰ TIME: {stamp(c):%H:%M}\n"
+                          f"🔒 OPENING HIGH: ₹{high:.2f}\n"
+                          f"🚀 CLOSE: ₹{close:.2f}\n"
+                          f"📊 VOLUME: {volume:,.0f}\n"
+                          f"📉 PREVIOUS VOLUME: {previous_volume:,.0f}\n"
+                          "✅ Close above opening high\n"
+                          "✅ Volume greater than previous candle\n"
+                          "⚠️ Alert only; no order placed."
+                      )
+                      telegram(message)
+                      log(f"BUY SIGNAL: {stock['symbol']}")
+
+              state["last_processed"][name] = candles[-1][0]
+
+          def main():
+              now = datetime.now(IST)
+              if now.weekday() >= 5 or not (
+                  clock_time(9, 15) <= now.time() <= clock_time(15, 30)
+              ):
+                  log("Outside market hours")
+                  return
+
+              today = now.strftime("%Y-%m-%d")
+              state = read_state(today)
+              api = login()
+              stocks = get_stocks()
+
+              try:
+                  for i, (name, stock) in enumerate(stocks.items(), 1):
+                      try:
+                          scan_one(api, name, stock, state, today, now)
+                      except Exception as e:
+                          log(f"ERROR {stock['symbol']}: {e}")
+
+                      if i % 10 == 0:
+                          save_state(state)
+                          log(f"Progress: {i}/{len(stocks)}")
+                      time.sleep(0.55)
+
+                  save_state(state)
+                  log("Scan completed")
+              finally:
+                  try:
+                      api.terminateSession(os.environ["ANGEL_CLIENT_ID"])
+                  except Exception:
+                      pass
+
+          if __name__ == "__main__":
+              main()
+          PYTHON
+          python scanner_runtime.py
+
+      - name: Save scanner progress
         if: always()
         run: |
           git config user.name "github-actions[bot]"
