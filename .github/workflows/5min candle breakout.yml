@@ -28,6 +28,14 @@ jobs:
           python-version: "3.12"
 
      
+      - name: Restore/cache Angel instrument master
+        uses: actions/cache@v4
+        with:
+          path: OpenAPIScripMaster.json
+          key: angel-master-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            angel-master-${{ runner.os }}-
+
       - name: Install libraries
         run: |
           python -m pip install --upgrade pip
@@ -88,10 +96,77 @@ jobs:
               log("Angel One login successful")
               return api
 
+          MASTER_FILE = "OpenAPIScripMaster.json"
+
+          def load_master_data():
+              """Download the Angel master with retries; use cache only if download fails."""
+              temp_file = MASTER_FILE + ".part"
+              last_error = None
+
+              for attempt in range(1, 6):
+                  try:
+                      log(f"Downloading Angel master: attempt {attempt}/5")
+                      with requests.get(
+                          MASTER_URL,
+                          stream=True,
+                          timeout=(20, 180),
+                          headers={"User-Agent": "Mozilla/5.0"},
+                      ) as response:
+                          response.raise_for_status()
+                          with open(temp_file, "wb") as output:
+                              for chunk in response.iter_content(
+                                  chunk_size=256 * 1024
+                              ):
+                                  if chunk:
+                                      output.write(chunk)
+
+                      # Verify the entire response is valid JSON before replacing cache.
+                      with open(temp_file, "r", encoding="utf-8") as source:
+                          master = json.load(source)
+
+                      if not isinstance(master, list) or not master:
+                          raise ValueError("Master JSON is empty or not a list")
+
+                      os.replace(temp_file, MASTER_FILE)
+                      log(f"Master downloaded and verified: {len(master)} records")
+                      return master
+
+                  except (
+                      requests.RequestException,
+                      OSError,
+                      ValueError,
+                      json.JSONDecodeError,
+                  ) as exc:
+                      last_error = exc
+                      log(f"Master download attempt {attempt} failed: {exc}")
+                      try:
+                          if os.path.exists(temp_file):
+                              os.remove(temp_file)
+                      except OSError:
+                          pass
+                      if attempt < 5:
+                          time.sleep(attempt * 3)
+
+              # A previously cached valid master is a fallback only; never use a partial file.
+              try:
+                  with open(MASTER_FILE, "r", encoding="utf-8") as source:
+                      master = json.load(source)
+                  if isinstance(master, list) and master:
+                      log(
+                          f"WARNING: using cached master after download failures "
+                          f"({len(master)} records); last error: {last_error}"
+                      )
+                      return master
+              except (OSError, ValueError, json.JSONDecodeError):
+                  pass
+
+              raise RuntimeError(
+                  f"Could not download Angel master after 5 attempts and no valid "
+                  f"cached copy was available. Last error: {last_error}"
+              )
+
           def get_stocks():
-              r = requests.get(MASTER_URL, timeout=90)
-              r.raise_for_status()
-              master = r.json()
+              master = load_master_data()
               names = {
                   str(x.get("name", "")).strip().upper()
                   for x in master
