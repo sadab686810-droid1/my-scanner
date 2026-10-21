@@ -195,6 +195,8 @@ jobs:
                   if s.get("date") == today:
                       s.setdefault("opening_high", {})
                       s.setdefault("last_processed", {})
+                      s.setdefault("last_alert_candle", {})
+                      s.setdefault("alerted_stocks", [])
                       s.setdefault("invalid_open", [])
                       return s
               except (OSError, ValueError):
@@ -203,6 +205,8 @@ jobs:
                   "date": today,
                   "opening_high": {},
                   "last_processed": {},
+                  "last_alert_candle": {},
+                  "alerted_stocks": [],
                   "invalid_open": []
               }
 
@@ -226,7 +230,12 @@ jobs:
               return result.get("data") or []
 
           def stamp(c):
-              return datetime.fromisoformat(str(c[0])).astimezone(IST)
+              dt = datetime.fromisoformat(str(c[0]))
+              if dt.tzinfo is None:
+                  dt = dt.replace(tzinfo=IST)
+              else:
+                  dt = dt.astimezone(IST)
+              return dt
 
           def complete(c, now):
               try:
@@ -249,9 +258,10 @@ jobs:
               candles = get_candles(api, stock["token"], today, now)
               if candles is None:
                   return
+
               candles = sorted(
                   [c for c in candles if complete(c, now)],
-                  key=lambda c: c[0]
+                  key=stamp
               )
               if not candles:
                   return
@@ -270,43 +280,62 @@ jobs:
                   if not valid_opening(opening):
                       state["invalid_open"].append(name)
                       state["last_processed"][name] = candles[-1][0]
+                      log(f"{stock['symbol']}: opening candle invalid; BUY setup disabled today")
                       return
+
                   state["opening_high"][name] = float(opening[2])
                   log(f"{stock['symbol']} opening high: {opening[2]}")
 
-              high = float(state["opening_high"][name])
-              last = state["last_processed"].get(name)
+              opening_high = float(state["opening_high"][name])
 
-              for i, c in enumerate(candles):
-                  cid = c[0]
-                  if cid == opening[0] or (last and cid <= last):
-                      continue
-                  if i == 0:
-                      continue
+              # Check the latest completed 5-minute candle on every run.
+              # Send another update only when a NEW candle qualifies.
+              latest = candles[-1]
+              latest_dt = stamp(latest)
+              if latest_dt == stamp(opening) or len(candles) < 2:
+                  state["last_processed"][name] = latest[0]
+                  return
 
-                  previous = candles[i - 1]
-                  close = float(c[4])
-                  volume = float(c[5])
-                  previous_volume = float(previous[5])
+              previous = candles[-2]
+              close = float(latest[4])
+              volume = float(latest[5])
+              previous_volume = float(previous[5])
+              last_alert_candle = state["last_alert_candle"].get(name)
 
-                  if close > high and volume > previous_volume:
-                      message = (
-                          "🟢 NSE F&O BREAKOUT BUY\n"
-                          "━━━━━━━━━━━━━━━━━━\n"
-                          f"📌 STOCK: {stock['symbol']}\n"
-                          f"⏰ TIME: {stamp(c):%H:%M}\n"
-                          f"🔒 OPENING HIGH: ₹{high:.2f}\n"
-                          f"🚀 CLOSE: ₹{close:.2f}\n"
-                          f"📊 VOLUME: {volume:,.0f}\n"
-                          f"📉 PREVIOUS VOLUME: {previous_volume:,.0f}\n"
-                          "✅ Close above opening high\n"
-                          "✅ Volume greater than previous candle\n"
-                          "⚠️ Alert only; no order placed."
-                      )
-                      telegram(message)
-                      log(f"BUY SIGNAL: {stock['symbol']}")
+              qualifies = close > opening_high and volume > previous_volume
+              if qualifies and last_alert_candle != latest[0]:
+                  already_alerted = name in state["alerted_stocks"]
+                  title = (
+                      "🔄 NSE F&O BREAKOUT UPDATE"
+                      if already_alerted
+                      else "🟢 NSE F&O BREAKOUT BUY SIGNAL"
+                  )
+                  message = (
+                      f"{title}\\n"
+                      "━━━━━━━━━━━━━━━━━━\\n"
+                      f"📌 STOCK: {stock['symbol']}\\n"
+                      f"⏰ COMPLETED CANDLE: {latest_dt:%H:%M} IST\\n"
+                      f"🔒 OPENING HIGH: ₹{opening_high:.2f}\\n"
+                      f"🚀 LATEST CLOSE: ₹{close:.2f}\\n"
+                      f"📊 CANDLE VOLUME: {volume:,.0f}\\n"
+                      f"📉 PREVIOUS CANDLE VOLUME: {previous_volume:,.0f}\\n"
+                      "✅ Close above opening high\\n"
+                      "✅ Volume greater than previous candle\\n"
+                      "🔔 Another qualifying 5-minute candle can send an update.\\n"
+                      "⚠️ Alert only; no order placed."
+                  )
 
-              state["last_processed"][name] = candles[-1][0]
+                  # Record the candle only after Telegram confirms delivery.
+                  telegram(message)
+                  state["last_alert_candle"][name] = latest[0]
+                  if name not in state["alerted_stocks"]:
+                      state["alerted_stocks"].append(name)
+                  log(
+                      f"BREAKOUT UPDATE: {stock['symbol']} "
+                      f"candle={latest_dt:%H:%M} close={close:.2f}"
+                  )
+
+              state["last_processed"][name] = latest[0]
 
           def main():
               now = datetime.now(IST)
