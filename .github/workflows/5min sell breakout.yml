@@ -27,6 +27,14 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Restore Angel One master-file cache
+        uses: actions/cache@v4
+        with:
+          path: OpenAPIScripMaster.json
+          key: angel-master-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            angel-master-${{ runner.os }}-
+
       - name: Install libraries
         run: |
           python -m pip install --upgrade pip
@@ -59,8 +67,83 @@ jobs:
               "OpenAPI_File/files/OpenAPIScripMaster.json"
           )
 
+          MASTER_FILE = "OpenAPIScripMaster.json"
+          MASTER_PART = MASTER_FILE + ".part"
           STATE_FILE = "sell_scanner_state.json"
           BODY_MIN = 75.0
+
+          def load_master_data():
+              """Download the Angel master safely; use cached valid data if needed."""
+              last_error = None
+
+              for attempt in range(1, 6):
+                  try:
+                      log(
+                          f"Downloading Angel master "
+                          f"(attempt {attempt}/5)..."
+                      )
+                      with requests.get(
+                          MASTER_URL,
+                          stream=True,
+                          timeout=(15, 120),
+                          headers={"User-Agent": "Mozilla/5.0"},
+                      ) as response:
+                          response.raise_for_status()
+                          with open(MASTER_PART, "wb") as file:
+                              for chunk in response.iter_content(
+                                  chunk_size=1024 * 1024
+                              ):
+                                  if chunk:
+                                      file.write(chunk)
+
+                      # Validate the complete file before replacing the cache.
+                      with open(MASTER_PART, "r", encoding="utf-8") as file:
+                          master = json.load(file)
+
+                      if not isinstance(master, list) or not master:
+                          raise ValueError(
+                              "Angel master JSON is not a non-empty list"
+                          )
+
+                      os.replace(MASTER_PART, MASTER_FILE)
+                      log(f"Angel master downloaded and validated: {len(master)} rows")
+                      return master
+
+                  except Exception as error:
+                      last_error = error
+                      log(
+                          f"Master download failed: "
+                          f"{type(error).__name__}: {error}"
+                      )
+                      try:
+                          if os.path.exists(MASTER_PART):
+                              os.remove(MASTER_PART)
+                      except OSError:
+                          pass
+
+                      if attempt < 5:
+                          time.sleep(min(attempt * 3, 12))
+
+              # Only fall back to a cache that parses and has expected structure.
+              try:
+                  with open(MASTER_FILE, "r", encoding="utf-8") as file:
+                      master = json.load(file)
+                  if isinstance(master, list) and master:
+                      log(
+                          f"Using cached Angel master after download failures: "
+                          f"{len(master)} rows"
+                      )
+                      return master
+              except Exception as cache_error:
+                  log(
+                      f"No usable cached master: "
+                      f"{type(cache_error).__name__}: {cache_error}"
+                  )
+
+              raise RuntimeError(
+                  f"Could not download a valid Angel master after 5 attempts; "
+                  f"last error: {last_error}"
+              )
 
           REQUIRED = [
               "ANGEL_API_KEY",
@@ -143,9 +226,7 @@ jobs:
               return api
 
           def load_stocks():
-              response = requests.get(MASTER_URL, timeout=90)
-              response.raise_for_status()
-              master = response.json()
+              master = load_master_data()
 
               futures_names = {
                   str(item.get("name", "")).strip().upper()
