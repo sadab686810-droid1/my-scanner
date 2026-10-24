@@ -237,9 +237,17 @@ jobs:
 
           def main():
               now = datetime.now(IST)
-              if now.weekday() >= 5 or not (dtime(9,15) <= now.time() <= dtime(15,30)):
-                  log('Outside NSE market hours')
-                  return
+              # TEST: Telegram connectivity
+              try:
+                 telegram("✅ NSE FNO Scanner: Telegram test successful")
+              except Exception as e:
+                 log(f"Telegram test failed: {e}")
+
+              if now.weekday() >= 5 or not (
+                 dtime(9, 15) <= now.time() <= dtime(15, 30)
+              ):
+               log("Outside NSE market hours")
+               return
               today = now.date().isoformat()
               s = load_state(today)
               client = env('ANGEL_CLIENT_ID')
