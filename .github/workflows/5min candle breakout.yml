@@ -1,3 +1,9 @@
+on:
+  schedule:
+    # Every 5 minutes, covering the Indian market session
+    - cron: "*/5 3-9 * * 1-5"
+    - cron: "0 10 * * 1-5"
+  workflow_dispatch:
 import json
 import os
 import time
