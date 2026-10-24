@@ -234,6 +234,8 @@ jobs:
               s['last_status'] = now.timestamp()
               save(s)
               log('5-minute status sent')
+          def telegram(message):
+              send(message)
 
           def main():
               now = datetime.now(IST)
