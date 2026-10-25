@@ -236,14 +236,17 @@ jobs:
               log('5-minute status sent')
           def telegram(message):
               send(message)
+              def main():
+                  now = datetime.now(IST)
 
-          def main():
-              now = datetime.now(IST)
-              # TEST: Telegram connectivity
-              try:
-                 telegram("✅ NSE FNO Scanner: Telegram test successful")
-              except Exception as e:
-                 log(f"Telegram test failed: {e}")
+                  if now.weekday() >= 5 or not (
+                       dtime(9, 15) <= now.time() <= dtime(15, 30)
+                  ):
+                  log("Outside NSE market hours")
+                  return
+
+                  today = now.date().isoformat()
+                  s = load_state(today)
 
               if now.weekday() >= 5 or not (
                  dtime(9, 15) <= now.time() <= dtime(15, 30)
