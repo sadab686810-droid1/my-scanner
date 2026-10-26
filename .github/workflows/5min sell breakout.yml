@@ -1,11 +1,12 @@
 name: NSE FNO 5-Min Breadown Scanner (YAML Only)
 
 on:
-  workflow_dispatch:
+ 
   schedule:
     # 09:05 IST Monday-Friday (GitHub cron uses UTC)
     - cron: "35 3 * * 1-5"
-
+  workflow_dispatch:
+  
 permissions:
   contents: write
 
