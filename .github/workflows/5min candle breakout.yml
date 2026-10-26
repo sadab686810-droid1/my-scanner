@@ -164,7 +164,7 @@ jobs:
                       last_error = exc
                       log(f"{interval} token {token} error: {exc}")
                   if attempt == 0:
-                      time.sleep(2)
+                      time.sleep(8)
               log(f"Could not fetch {interval} candles token={token}: {last_error}")
               return None
 
