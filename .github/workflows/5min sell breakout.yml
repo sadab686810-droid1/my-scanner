@@ -1,46 +1,39 @@
-
-name: NSE FNO 5 Minute SELL Scanner
+name: NSE FNO 5-Min Breadown Scanner (YAML Only)
 
 on:
-  schedule:
-    - cron: "*/5 3-10 * * 1-5"
   workflow_dispatch:
+  schedule:
+    # 09:05 IST Monday-Friday (GitHub cron uses UTC)
+    - cron: "35 3 * * 1-5"
 
 permissions:
   contents: write
 
 concurrency:
-  group: nse-fno-sell-scanner
+  group: nse-fno-5m-sell-breakdown
   cancel-in-progress: false
 
 jobs:
-  scan:
+  scanner:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
+    timeout-minutes: 350
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
-      - name: Restore Angel One master-file cache
-        uses: actions/cache@v4
-        with:
-          path: OpenAPIScripMaster.json
-          key: angel-master-${{ runner.os }}-${{ github.run_id }}
-          restore-keys: |
-            angel-master-${{ runner.os }}-
-
-      - name: Install libraries
+      - name: Install packages
         run: |
           python -m pip install --upgrade pip
-          python -m pip install smartapi-python pyotp requests logzero websocket-client pycryptodome
+          pip install smartapi-python websocket-client requests pyotp logzero
 
-      - name: Create and run SELL scanner
+      - name: Create and run scanner (all Python is inside this YAML)
         env:
           ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
           ANGEL_CLIENT_ID: ${{ secrets.ANGEL_CLIENT_ID }}
@@ -48,499 +41,594 @@ jobs:
           ANGEL_TOTP: ${{ secrets.ANGEL_TOTP }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        shell: bash
         run: |
-          cat > sell_scanner.py <<'PYTHON'
-          import os
-          import json
-          import time
-          import requests
-          import pyotp
-
-          from datetime import datetime, timedelta, time as clock_time
+          cat > scanner.py <<'PYTHON_SCRIPT'
+          import os, json, time, threading, requests, pyotp, zipfile, io, csv
+          from datetime import datetime, timedelta, time as dtime
           from zoneinfo import ZoneInfo
           from SmartApi import SmartConnect
-
+          from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+          
+          # ============================================================
+          # NSE F&O 5-MIN SELL BREAKDOWN SCANNER
+          # Previous day OHLC is read from previous_day_ohlc.json.
+          # Today's 09:15-09:20 opening candle low is fetched from API.
+          # Then WebSocket ticks build live 5-minute candles.
+          # SELL alert when a completed 5-minute candle CLOSES below opening low.
+          # No orders are placed.
+          # ============================================================
+          
           IST = ZoneInfo("Asia/Kolkata")
-
-          MASTER_URL = (
-              "https://margincalculator.angelone.in/"
-              "OpenAPI_File/files/OpenAPIScripMaster.json"
-          )
-
-          MASTER_FILE = "OpenAPIScripMaster.json"
-          MASTER_PART = MASTER_FILE + ".part"
-          STATE_FILE = "sell_scanner_state.json"
-          BODY_MIN = 75.0
-
-          def load_master_data():
-              """Download the Angel master safely; use cached valid data if needed."""
-              last_error = None
-
-              for attempt in range(1, 6):
-                  try:
-                      log(
-                          f"Downloading Angel master "
-                          f"(attempt {attempt}/5)..."
-                      )
-                      with requests.get(
-                          MASTER_URL,
-                          stream=True,
-                          timeout=(15, 120),
-                          headers={"User-Agent": "Mozilla/5.0"},
-                      ) as response:
-                          response.raise_for_status()
-                          with open(MASTER_PART, "wb") as file:
-                              for chunk in response.iter_content(
-                                  chunk_size=1024 * 1024
-                              ):
-                                  if chunk:
-                                      file.write(chunk)
-
-                      # Validate the complete file before replacing the cache.
-                      with open(MASTER_PART, "r", encoding="utf-8") as file:
-                          master = json.load(file)
-
-                      if not isinstance(master, list) or not master:
-                          raise ValueError(
-                              "Angel master JSON is not a non-empty list"
-                          )
-
-                      os.replace(MASTER_PART, MASTER_FILE)
-                      log(f"Angel master downloaded and validated: {len(master)} rows")
-                      return master
-
-                  except Exception as error:
-                      last_error = error
-                      log(
-                          f"Master download failed: "
-                          f"{type(error).__name__}: {error}"
-                      )
-                      try:
-                          if os.path.exists(MASTER_PART):
-                              os.remove(MASTER_PART)
-                      except OSError:
-                          pass
-
-                      if attempt < 5:
-                          time.sleep(min(attempt * 3, 12))
-
-              # Only fall back to a cache that parses and has expected structure.
+          START = dtime(9, 15)
+          STOP = dtime(15, 0)
+          STATUS_SECONDS = 300
+          BODY_MIN_PERCENT = 70.0
+          OPEN_HIGH_TOLERANCE = 0.00  # exact equality after rounding to 2 decimals
+          API_GAP = 1.25
+          MASTER_URL = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
+          CACHE_FILE = "previous_day_ohlc.json"
+          STATE_FILE = "scanner_state.json"
+          
+          API_KEY = os.getenv("ANGEL_API_KEY", "")
+          CLIENT_ID = os.getenv("ANGEL_CLIENT_ID", "")
+          PASSWORD = os.getenv("ANGEL_PASSWORD", "")
+          TOTP_SECRET = os.getenv("ANGEL_TOTP", "")
+          BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+          CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+          
+          lock = threading.RLock()
+          last_status = 0
+          ws_ready = False
+          ws = None
+          smart = None
+          today = None
+          opening_low = {}       # symbol -> 09:15 candle low
+          opening_saved = set()
+          alerted = set()
+          candles = {}            # symbol -> current 5-min bucket OHLC
+          last_prices = {}
+          stock_tokens = {}       # symbol -> NSE cash token
+          eligible = {}
+          previous_cache = {}
+          state = {}
+          
+          def now_ist():
+              return datetime.now(IST)
+          
+          def log(msg):
+              print(f"[{now_ist():%H:%M:%S}] {msg}", flush=True)
+          
+          def telegram(text):
+              if not BOT_TOKEN or not CHAT_ID:
+                  log("Telegram credentials missing; message not sent.")
+                  return
               try:
-                  with open(MASTER_FILE, "r", encoding="utf-8") as file:
-                      master = json.load(file)
-                  if isinstance(master, list) and master:
-                      log(
-                          f"Using cached Angel master after download failures: "
-                          f"{len(master)} rows"
-                      )
-                      return master
-              except Exception as cache_error:
-                  log(
-                      f"No usable cached master: "
-                      f"{type(cache_error).__name__}: {cache_error}"
+                  r = requests.post(
+                      f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                      data={"chat_id": CHAT_ID, "text": text},
+                      timeout=12
                   )
-
-              raise RuntimeError(
-                  f"Could not download a valid Angel master after 5 attempts; "
-                  f"last error: {last_error}"
-              )
-
-          REQUIRED = [
-              "ANGEL_API_KEY",
-              "ANGEL_CLIENT_ID",
-              "ANGEL_PASSWORD",
-              "ANGEL_TOTP",
-              "TELEGRAM_BOT_TOKEN",
-              "TELEGRAM_CHAT_ID",
-          ]
-
-          def log(message):
-              print(
-                  f"[{datetime.now(IST):%Y-%m-%d %H:%M:%S}] {message}",
-                  flush=True
-              )
-
-          def validate_secrets():
-              missing = [
-                  key for key in REQUIRED
-                  if not os.environ.get(key, "").strip()
-              ]
-              if missing:
-                  raise RuntimeError(
-                      "Missing GitHub Actions secrets: " + ", ".join(missing)
-                  )
-
-          def telegram(message):
-              token = os.environ["TELEGRAM_BOT_TOKEN"].strip()
-              chat_id = os.environ["TELEGRAM_CHAT_ID"].strip()
-
-              response = requests.post(
-                  f"https://api.telegram.org/bot{token}/sendMessage",
-                  json={
-                      "chat_id": chat_id,
-                      "text": message,
-                  },
-                  timeout=20,
-              )
-
-              if not response.ok:
-                  raise RuntimeError(
-                      f"Telegram HTTP {response.status_code}: "
-                      f"{response.text[:500]}"
-                  )
-
-              result = response.json()
-              if not result.get("ok"):
-                  raise RuntimeError(
-                      f"Telegram rejected message: {result}"
-                  )
-
-              log("Telegram SELL alert sent successfully")
-
+                  if not r.ok:
+                      log(f"Telegram error: {r.status_code} {r.text[:250]}")
+              except Exception as e:
+                  log(f"Telegram exception: {e}")
+          
+          def load_json(path, default):
+              try:
+                  with open(path, "r", encoding="utf-8") as f:
+                      return json.load(f)
+              except Exception:
+                  return default
+          
+          def save_json(path, data):
+              tmp = path + ".tmp"
+              with open(tmp, "w", encoding="utf-8") as f:
+                  json.dump(data, f, indent=2)
+              os.replace(tmp, path)
+          
           def login():
-              otp_input = os.environ["ANGEL_TOTP"].strip()
-
-              if len(otp_input) == 6 and otp_input.isdigit():
-                  otp = otp_input
-              else:
-                  otp = pyotp.TOTP(
-                      otp_input.replace(" ", "")
-                  ).now()
-
-              api = SmartConnect(
-                  api_key=os.environ["ANGEL_API_KEY"].strip()
-              )
-
-              result = api.generateSession(
-                  os.environ["ANGEL_CLIENT_ID"].strip(),
-                  os.environ["ANGEL_PASSWORD"].strip(),
-                  otp,
-              )
-
+              global smart
+              if not all([API_KEY, CLIENT_ID, PASSWORD, TOTP_SECRET]):
+                  raise RuntimeError("Missing Angel One secrets: API key, client ID, password or TOTP.")
+              smart = SmartConnect(api_key=API_KEY)
+              otp = pyotp.TOTP(TOTP_SECRET).now()
+              result = smart.generateSession(CLIENT_ID, PASSWORD, otp)
               if not result or not result.get("status"):
-                  raise RuntimeError(
-                      f"Angel One login failed: {result}"
-                  )
-
-              log("Angel One login successful")
-              return api
-
-          def load_stocks():
-              master = load_master_data()
-
-              futures_names = {
-                  str(item.get("name", "")).strip().upper()
-                  for item in master
-                  if item.get("exch_seg") == "NFO"
-                  and item.get("instrumenttype") == "FUTSTK"
-                  and item.get("name")
-              }
-
-              stocks = {}
-
-              for item in master:
-                  symbol = str(item.get("symbol", "")).strip()
-                  token = str(item.get("token", "")).strip()
-
-                  if item.get("exch_seg") != "NSE":
+                  raise RuntimeError(f"Angel One login failed: {result}")
+              data = result["data"]
+              jwt = data["jwtToken"]
+              feed = smart.getfeedToken()
+              log("Angel One login successful.")
+              return jwt, feed
+          
+          def load_master():
+              # Bounded download with retries so GitHub Actions never hangs here indefinitely.
+              last_error = None
+              rows = None
+              for attempt in range(1, 4):
+                  try:
+                      log(f"Downloading Angel One instrument master (attempt {attempt}/3)...")
+                      r = requests.get(
+                          MASTER_URL,
+                          headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+                          timeout=(10, 25)
+                      )
+                      r.raise_for_status()
+                      log(f"Instrument master HTTP {r.status_code}; response bytes={len(r.content)}")
+                      rows = r.json()
+                      if not isinstance(rows, list) or not rows:
+                          raise ValueError("Instrument master JSON is empty or not a list")
+                      break
+                  except Exception as e:
+                      last_error = e
+                      log(f"Instrument master attempt {attempt}/3 failed: {type(e).__name__}: {e}")
+                      if attempt < 3:
+                          wait_s = attempt * 5
+                          log(f"Retrying instrument master in {wait_s}s...")
+                          time.sleep(wait_s)
+              if rows is None:
+                  raise RuntimeError(f"Instrument master download failed after 3 attempts: {last_error}")
+              # F&O stock universe from NFO FUTSTK; map to NSE EQ token.
+              fno_names = set()
+              for x in rows:
+                  if x.get("exch_seg") == "NFO" and x.get("instrumenttype") == "FUTSTK":
+                      n = x.get("name", "").upper().strip()
+                      if n:
+                          fno_names.add(n)
+              result = {}
+              nse_eq_rows = 0
+              # In Angel's master, NSE cash EQ rows are reliably identified by
+              # exch_seg=NSE and symbol ending in -EQ. instrumenttype may be blank,
+              # so do not require instrumenttype == "EQ".
+              for x in rows:
+                  if str(x.get("exch_seg", "")).upper().strip() != "NSE":
                       continue
-
-                  if not symbol.endswith("-EQ") or not token:
+                  sym = str(x.get("symbol", "")).upper().strip()
+                  if not sym.endswith("-EQ"):
                       continue
+                  nse_eq_rows += 1
+                  base_symbol = sym[:-3].strip()
+                  token = str(x.get("token", "")).strip()
+                  if base_symbol in fno_names and token:
+                      result[base_symbol] = token
 
-                  name = symbol[:-3].upper()
-
-                  if name in futures_names:
-                      stocks[name] = {
-                          "symbol": symbol,
-                          "token": token,
-                      }
-
-              if not stocks:
+              if not result:
+                  # Helpful diagnostics to identify instrument-master schema differences.
+                  sample_nfo = [
+                      {k: x.get(k) for k in ("exch_seg", "instrumenttype", "name", "symbol", "token")}
+                      for x in rows
+                      if str(x.get("exch_seg", "")).upper().strip() == "NFO"
+                      and "FUT" in str(x.get("instrumenttype", "")).upper()
+                  ][:3]
+                  sample_nse = [
+                      {k: x.get(k) for k in ("exch_seg", "instrumenttype", "name", "symbol", "token")}
+                      for x in rows
+                      if str(x.get("exch_seg", "")).upper().strip() == "NSE"
+                  ][:3]
                   raise RuntimeError(
-                      "No NSE F&O equity stocks mapped from master file"
+                      "Could not map NSE cash tokens to NFO FUTSTK names. "
+                      f"NFO FUTSTK names={len(fno_names)}, NSE -EQ rows={nse_eq_rows}; "
+                      f"NFO samples={sample_nfo}; NSE samples={sample_nse}"
                   )
-
-              log(f"Mapped NSE F&O stocks: {len(stocks)}")
-              return stocks
-
-          def read_state(today):
-              try:
-                  with open(STATE_FILE, encoding="utf-8") as file:
-                      state = json.load(file)
-
-                  if state.get("date") == today:
-                      state.setdefault("opening_low", {})
-                      state.setdefault("last_processed", {})
-                      state.setdefault("invalid_open", [])
-                      return state
-
-              except (OSError, ValueError):
-                  pass
-
-              return {
-                  "date": today,
-                  "opening_low": {},
-                  "last_processed": {},
-                  "invalid_open": [],
+              log(f"F&O stocks mapped to NSE cash tokens: {len(result)}")
+              return result
+          
+          
+          def fetch_previous_day_bhavcopy(stock_symbols, current_date):
+              """
+              Download NSE CM bhavcopy (not Angel ONE_DAY candles), find the latest
+              available trading date before today, and build OHLC cache for F&O stocks.
+              """
+              headers = {
+                  "User-Agent": "Mozilla/5.0",
+                  "Accept": "*/*",
+                  "Referer": "https://www.nseindia.com/",
               }
+              # NSE's newer CM bhavcopy archive naming pattern.
+              for days_back in range(1, 13):
+                  d = current_date - timedelta(days=days_back)
+                  if d.weekday() >= 5:
+                      continue
+                  ymd = d.strftime("%Y%m%d")
+                  url = f"https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{ymd}_F_0000.csv.zip"
+                  try:
+                      resp = requests.get(url, headers=headers, timeout=25)
+                      if resp.status_code != 200 or not resp.content.startswith(b"PK"):
+                          continue
+                      with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                          csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+                          if not csv_names:
+                              continue
+                          raw = zf.read(csv_names[0]).decode("utf-8-sig", errors="replace")
+                          reader = csv.DictReader(io.StringIO(raw))
+                          rows = list(reader)
+                      if not rows:
+                          continue
+                      # Support current NSE CM bhavcopy column names and older names.
+                      first = rows[0]
+                      if "TckrSymb" in first:
+                          sym_key, series_key = "TckrSymb", "SctySrs"
+                          open_key, high_key, low_key, close_key = "OpnPric", "HghPric", "LwPric", "ClsPric"
+                      else:
+                          sym_key, series_key = "SYMBOL", "SERIES"
+                          open_key, high_key, low_key, close_key = "OPEN", "HIGH", "LOW", "CLOSE"
+                      found = {}
+                      for row in rows:
+                          sym = (row.get(sym_key) or "").upper().strip()
+                          series = (row.get(series_key) or "EQ").upper().strip()
+                          if sym not in stock_symbols or series != "EQ":
+                              continue
+                          try:
+                              found[sym] = {
+                                  "date": d.isoformat(),
+                                  "open": float(row[open_key]),
+                                  "high": float(row[high_key]),
+                                  "low": float(row[low_key]),
+                                  "close": float(row[close_key]),
+                              }
+                          except (ValueError, KeyError, TypeError):
+                              continue
+                      if found:
+                          log(f"NSE bhavcopy cache refreshed from {d.isoformat()}: {len(found)} symbols")
+                          return {"date": d.isoformat(), "stocks": found, "source": "NSE CM bhavcopy"}
+                  except Exception as e:
+                      log(f"Bhavcopy download failed for {d.isoformat()}: {e}")
+              return None
+          
+          filter_counts = {"ohlc": 0, "open_high": 0, "bearish": 0, "body70": 0, "eligible": 0, "bad_row": 0}
 
-          def save_state(state):
-              temporary = STATE_FILE + ".tmp"
-
-              with open(temporary, "w", encoding="utf-8") as file:
-                  json.dump(state, file)
-
-              os.replace(temporary, STATE_FILE)
-
-          def candle_time(candle_or_timestamp):
-              raw = (
-                  candle_or_timestamp[0]
-                  if isinstance(candle_or_timestamp, (list, tuple))
-                  else candle_or_timestamp
-              )
-
-              dt = datetime.fromisoformat(str(raw))
-
-              if dt.tzinfo is None:
-                  dt = dt.replace(tzinfo=IST)
-              else:
-                  dt = dt.astimezone(IST)
-
-              return dt
-
-          def is_complete(candle, now):
+          def previous_day_filter(symbol, row):
               try:
-                  return (
-                      candle_time(candle) + timedelta(minutes=5)
-                      <= now
-                  )
-              except (ValueError, TypeError, IndexError):
-                  return False
-
-          def valid_first_candle(candle):
-              try:
-                  opening, high, low, close = map(
-                      float, candle[1:5]
-                  )
-
-                  candle_range = high - low
-
-                  if candle_range <= 0:
+                  o, h, l, c = [float(row[k]) for k in ("open", "high", "low", "close")]
+                  filter_counts["ohlc"] += 1
+                  rng = h - l
+                  if rng <= 0:
+                      log(f"FILTER REJECT {symbol}: invalid range High={h} Low={l}")
                       return False
-
-                  body_percent = (
-                      abs(close - opening) / candle_range * 100
-                  )
-
-                  # First candle must be RED with body >= 75%.
-                  return (
-                      close < opening
-                      and body_percent >= BODY_MIN
-                  )
-
-              except (ValueError, TypeError, IndexError):
+                  open_is_high = round(o, 2) == round(h, 2)
+                  bearish = c < o
+                  body_pct = ((o - c) / rng) * 100.0
+                  if open_is_high:
+                      filter_counts["open_high"] += 1
+                  if bearish:
+                      filter_counts["bearish"] += 1
+                  if body_pct >= BODY_MIN_PERCENT:
+                      filter_counts["body70"] += 1
+                  passed = bearish and open_is_high and body_pct >= BODY_MIN_PERCENT
+                  if passed:
+                      filter_counts["eligible"] += 1
+                      log(f"ELIGIBLE {symbol}: O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f} body={body_pct:.1f}%")
+                  return passed
+              except Exception as e:
+                  filter_counts["bad_row"] += 1
+                  log(f"FILTER DATA ERROR {symbol}: {e}; row={row}")
                   return False
-
-          def get_candles(api, token, today, now):
-              result = api.getCandleData({
-                  "exchange": "NSE",
+          
+          def candle_api(exchange, token, interval, from_dt, to_dt):
+              # SmartAPI candle timestamps are interpreted in India market time.
+              params = {
+                  "exchange": exchange,
                   "symboltoken": str(token),
-                  "interval": "FIVE_MINUTE",
-                  "fromdate": f"{today} 09:15",
-                  "todate": now.strftime("%Y-%m-%d %H:%M"),
-              })
-
-              if not result or not result.get("status"):
-                  log(
-                      f"Candle API failed for token {token}: "
-                      f"{result}"
+                  "interval": interval,
+                  "fromdate": from_dt.strftime("%Y-%m-%d %H:%M"),
+                  "todate": to_dt.strftime("%Y-%m-%d %H:%M"),
+              }
+              for attempt in range(4):
+                  try:
+                      resp = smart.getCandleData(params)
+                      time.sleep(API_GAP)
+                      if resp and resp.get("status") and resp.get("data"):
+                          return resp["data"]
+                      log(f"Candle API empty/error token={token}: {resp}")
+                  except Exception as e:
+                      log(f"Candle API attempt {attempt+1}/4 token={token}: {e}")
+                  time.sleep(3 + attempt * 4)
+              return []
+          
+          def read_opening_candle(symbol, token, current):
+              # Fetch the 09:15-09:20 candle from API. Only use it after 09:20.
+              start = current.replace(hour=9, minute=15, second=0, microsecond=0)
+              end = current.replace(hour=9, minute=20, second=0, microsecond=0)
+              data = candle_api("NSE", token, "FIVE_MINUTE", start, end)
+              for c in data:
+                  # Angel candle row: [timestamp, open, high, low, close, volume]
+                  try:
+                      stamp = str(c[0])
+                      dt = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+                      if dt.tzinfo is None:
+                          dt = dt.replace(tzinfo=IST)
+                      dt = dt.astimezone(IST)
+                      if dt.hour == 9 and dt.minute == 15:
+                          return float(c[3])
+                  except Exception:
+                      continue
+              # Do not guess the low if API did not return the completed opening candle.
+              return None
+          
+          def bucket_start(dt):
+              minute = (dt.minute // 5) * 5
+              return dt.replace(minute=minute, second=0, microsecond=0)
+          
+          def finish_candle(symbol, c):
+              # Called only when a newer 5-minute bucket starts, so c is completed.
+              low = opening_low.get(symbol)
+              close = c["close"]
+              if low is None:
+                  return
+              if symbol not in alerted and c["start"].time() > dtime(9, 15) and close < low:
+                  alerted.add(symbol)
+                  msg = (
+                      "🔴 NSE F&O SELL BREAKDOWN\n"
+                      "━━━━━━━━━━━━━━━━━━\n"
+                      f"Stock: {symbol}\n"
+                      f"Opening 09:15-09:20 Low: ₹{low:.2f}\n"
+                      f"5-min Candle Close: ₹{close:.2f}\n"
+                      f"Candle time: {c['start']:%H:%M}–{(c['start'] + timedelta(minutes=5)):%H:%M}\n"
+                      f"Signal time: {now_ist():%H:%M:%S}\n"
+                      "Rule: completed 5-min close < opening low\n"
+                      "Alert only — no order placed."
                   )
-                  return None
-
-              return result.get("data") or []
-
-          def scan_stock(api, name, stock, state, today, now):
-              candles = get_candles(
-                  api, stock["token"], today, now
-              )
-
-              if candles is None:
+                  telegram(msg)
+                  log(f"SELL ALERT {symbol} close={close} opening_low={low}")
+          
+          def on_tick(symbol, price, tick_time):
+              if price <= 0 or tick_time.time() < START or tick_time.time() >= STOP:
                   return
-
-              candles = sorted(
-                  [c for c in candles if is_complete(c, now)],
-                  key=candle_time,
-              )
-
-              if not candles:
-                  return
-
-              opening = next(
-                  (
-                      c for c in candles
-                      if candle_time(c).strftime("%H:%M") == "09:15"
-                  ),
-                  None,
-              )
-
-              # Wait until the 09:15-09:20 candle is available.
-              if opening is None:
-                  return
-
-              if name in state["invalid_open"]:
-                  return
-
-              if name not in state["opening_low"]:
-                  if not valid_first_candle(opening):
-                      state["invalid_open"].append(name)
-                      state["last_processed"][name] = opening[0]
-
-                      log(
-                          f"{stock['symbol']}: opening candle invalid; "
-                          "SELL setup disabled for today"
-                      )
+              b = bucket_start(tick_time)
+              with lock:
+                  last_prices[symbol] = price
+                  cur = candles.get(symbol)
+                  if cur is None:
+                      candles[symbol] = {"start": b, "open": price, "high": price, "low": price, "close": price}
                       return
-
-                  state["opening_low"][name] = float(opening[3])
-
-                  log(
-                      f"{stock['symbol']}: opening LOW marked at "
-                      f"{float(opening[3]):.2f}"
+                  if b < cur["start"]:
+                      return
+                  if b > cur["start"]:
+                      finish_candle(symbol, cur)
+                      candles[symbol] = {"start": b, "open": price, "high": price, "low": price, "close": price}
+                      return
+                  cur["high"] = max(cur["high"], price)
+                  cur["low"] = min(cur["low"], price)
+                  cur["close"] = price
+          
+          def send_status():
+              with lock:
+                  n = len(stock_tokens)
+                  open_n = len(opening_low)
+                  alerts = len(alerted)
+                  connected = "YES" if ws_ready else "CONNECTING"
+                  message = (
+                      "📊 NSE F&O SCANNER STATUS\n"
+                      "━━━━━━━━━━━━━━━━━━\n"
+                      f"Time: {now_ist():%H:%M:%S} IST\n"
+                      f"WebSocket connected: {connected}\n"
+                      f"Mapped F&O stocks: {n}\n"
+                      f"Opening lows saved: {open_n}\n"
+                      f"SELL alerts today: {alerts}\n"
+                      f"Live tick symbols: {len(last_prices)}\n"
+                      f"Next update: about 5 minutes\n"
                   )
-
-              opening_low = float(state["opening_low"][name])
-              last_raw = state["last_processed"].get(name)
-              last_dt = candle_time(last_raw) if last_raw else None
-
-              for index, candle in enumerate(candles):
-                  candle_dt = candle_time(candle)
-
-                  if candle_dt == candle_time(opening):
-                      continue
-
-                  if last_dt and candle_dt <= last_dt:
-                      continue
-
-                  # Need the immediately previous completed candle.
-                  if index == 0:
-                      state["last_processed"][name] = candle[0]
-                      last_dt = candle_dt
-                      continue
-
-                  previous = candles[index - 1]
-
-                  close = float(candle[4])
-                  volume = float(candle[5])
-                  previous_volume = float(previous[5])
-
-                  # SELL: close below opening LOW and volume higher
-                  # than the immediately previous 5-minute candle.
-                  if (
-                      close < opening_low
-                      and volume > previous_volume
-                  ):
-                      message = (
-                          "🔴 NSE F&O SELL SIGNAL\n"
-                          "━━━━━━━━━━━━━━━━━━\n"
-                          f"📌 STOCK: {stock['symbol']}\n"
-                          f"⏰ CANDLE: {candle_dt:%H:%M}\n"
-                          f"🔒 OPENING LOW: ₹{opening_low:.2f}\n"
-                          f"📉 CANDLE CLOSE: ₹{close:.2f}\n"
-                          f"📊 BREAKDOWN VOLUME: {volume:,.0f}\n"
-                          f"📊 PREVIOUS VOLUME: "
-                          f"{previous_volume:,.0f}\n"
-                          "✅ Close below opening low\n"
-                          "✅ Volume greater than previous candle\n"
-                          "⚠️ Alert only. No order placed."
-                      )
-
-                      # If Telegram fails, this candle is not marked
-                      # processed, allowing a retry on the next run.
-                      telegram(message)
-                      log(
-                          f"SELL SIGNAL: {stock['symbol']} "
-                          f"close={close:.2f}"
-                      )
-
-                  state["last_processed"][name] = candle[0]
-                  last_dt = candle_dt
-
-              save_state(state)
-
-          def main():
-              validate_secrets()
-
-              now = datetime.now(IST)
-
-              if now.weekday() >= 5:
-                  log("Weekend: no scan")
-                  return
-
-              if not (
-                  clock_time(9, 20) <= now.time()
-                  <= clock_time(15, 30)
-              ):
-                  log("Outside SELL scanning hours (09:20-15:30 IST)")
-                  return
-
-              today = now.strftime("%Y-%m-%d")
-              state = read_state(today)
-
-              api = login()
-
+              telegram(message)
+              log("5-minute status update sent.")
+          
+          def on_data(wsapp, message):
+              # SmartWebSocketV2 commonly sends dict packets with token, exchange type,
+              # last_traded_price in paise, and exchange_timestamp in milliseconds.
               try:
-                  stocks = load_stocks()
-
-                  for count, (name, stock) in enumerate(
-                      stocks.items(), start=1
-                  ):
+                  if not isinstance(message, dict):
+                      return
+                  token = str(message.get("token", ""))
+                  sym = token_to_symbol.get(token)
+                  if not sym:
+                      return
+                  raw_price = message.get("last_traded_price")
+                  if raw_price is None:
+                      return
+                  price = float(raw_price) / 100.0
+                  ts = message.get("exchange_timestamp")
+                  if ts:
+                      tick_dt = datetime.fromtimestamp(float(ts) / 1000, IST)
+                  else:
+                      tick_dt = now_ist()
+                  on_tick(sym, price, tick_dt)
+              except Exception as e:
+                  log(f"Tick parse error: {e}")
+          
+          def on_open(wsapp):
+              global ws_ready
+              ws_ready = True
+              log("WebSocket connected.")
+              telegram("✅ NSE F&O scanner WebSocket connected. Live monitoring started.")
+          
+          def on_error(wsapp, error):
+              global ws_ready
+              ws_ready = False
+              log(f"WebSocket error: {error}")
+          
+          def on_close(wsapp, code, reason):
+              global ws_ready
+              ws_ready = False
+              log(f"WebSocket closed: {code} {reason}")
+          
+          def on_connect(wsapp):
+              # Subscribe in small batches to avoid overly large subscription requests.
+              tokens = list(stock_tokens.values())
+              for i in range(0, len(tokens), 50):
+                  batch = tokens[i:i+50]
+                  ws.subscribe(
+                      f"fno_batch_{i//50}",
+                      1,  # LTP mode
+                      [{"exchangeType": 1, "tokens": batch}]
+                  )
+                  time.sleep(0.4)
+              log(f"WebSocket subscription requests sent for {len(tokens)} NSE cash tokens.")
+          
+          def status_loop():
+              global last_status
+              while now_ist().time() < STOP:
+                  time.sleep(1)
+                  if now_ist().timestamp() - last_status >= STATUS_SECONDS:
+                      send_status()
+                      last_status = now_ist().timestamp()
+          
+          def save_caches():
+              previous_cache["updated_at"] = now_ist().isoformat()
+              save_json(CACHE_FILE, previous_cache)
+              state.update({
+                  "date": now_ist().date().isoformat(),
+                  "opening_low": opening_low,
+                  "alerted": sorted(alerted),
+              })
+              save_json(STATE_FILE, state)
+          
+          def main():
+              global today, previous_cache, state, opening_low, alerted, ws, ws_ready, last_status
+              today = now_ist().date()
+              previous_cache = load_json(CACHE_FILE, {})
+              state = load_json(STATE_FILE, {})
+              if state.get("date") == today.isoformat():
+                  opening_low = {k: float(v) for k, v in state.get("opening_low", {}).items()}
+                  alerted = set(state.get("alerted", []))
+          
+              if now_ist().time() >= STOP:
+                  log("Market session is over; exiting.")
+                  return
+          
+              jwt, feed_token = login()
+              stock_tokens = load_master()
+              globals()["stock_tokens"] = stock_tokens
+              globals()["token_to_symbol"] = {v: k for k, v in stock_tokens.items()}
+          
+              # Refresh OHLC from NSE CM bhavcopy, not Angel ONE ONE_DAY API.
+              # Cache is saved to the repository by the workflow's final commit step.
+              refreshed = fetch_previous_day_bhavcopy(set(stock_tokens.keys()), today)
+              if refreshed and refreshed.get("stocks"):
+                  previous_cache = refreshed
+                  save_json(CACHE_FILE, previous_cache)
+              elif previous_cache.get("stocks"):
+                  log("NSE bhavcopy unavailable; using existing previous-day OHLC cache.")
+              else:
+                  raise RuntimeError(
+                      "Could not download NSE bhavcopy and no previous_day_ohlc.json cache exists. "
+                      "Scanner stopped safely; no ONE_DAY API calls were made."
+                  )
+          
+              daily = previous_cache["stocks"]
+              for sym in stock_tokens:
+                  row = daily.get(sym)
+                  if row and previous_day_filter(sym, row):
+                      eligible[sym] = stock_tokens[sym]
+          
+              log(
+                  "PREVIOUS-DAY FILTER SUMMARY: "
+                  f"OHLC rows={filter_counts['ohlc']}, "
+                  f"Open=High={filter_counts['open_high']}, "
+                  f"Bearish={filter_counts['bearish']}, "
+                  f"Body>=70%={filter_counts['body70']}, "
+                  f"Eligible={filter_counts['eligible']}, "
+                  f"Bad rows={filter_counts['bad_row']}"
+              )
+              if not eligible:
+                  telegram(
+                      "⚠️ No stocks passed previous-day SELL filter.\n"
+                      f"OHLC rows: {filter_counts['ohlc']}\n"
+                      f"Open=High: {filter_counts['open_high']}\n"
+                      f"Bearish: {filter_counts['bearish']}\n"
+                      f"Body >=70%: {filter_counts['body70']}\n"
+                      "No SELL monitoring started."
+                  )
+                  log("No eligible stocks from previous-day cache; see filter summary above.")
+                  return
+          
+              # API opening candle fetch: after 09:20. Calls are rate-limited deliberately.
+              while now_ist().time() < dtime(9, 20):
+                  log("Waiting until 09:20 so the 09:15 opening candle is complete...")
+                  time.sleep(5)
+                  if now_ist().time() >= STOP:
+                      return
+          
+              telegram(
+                  "🚀 NSE F&O SELL scanner starting\n"
+                  f"Eligible stocks: {len(eligible)}\n"
+                  "Fetching completed 09:15-09:20 candle lows via API, then connecting WebSocket.\n"
+                  "Alert rule: later completed 5-minute close < 09:15 candle low."
+              )
+              for idx, (sym, token) in enumerate(eligible.items(), 1):
+                  low = read_opening_candle(sym, token, now_ist())
+                  if low is not None:
+                      opening_low[sym] = low
+                  else:
+                      log(f"Opening candle low unavailable for {sym}; it will be skipped.")
+                  if idx % 10 == 0:
+                      save_caches()
+                      log(f"Opening API progress: {idx}/{len(eligible)}")
+              save_caches()
+              log(f"Opening lows saved: {len(opening_low)}/{len(eligible)}")
+          
+              if not opening_low:
+                  telegram("❌ No opening candle lows returned by API. Scanner cannot monitor breakouts.")
+                  raise RuntimeError("No 09:15 opening lows were returned by API.")
+          
+              ws = SmartWebSocketV2(jwt, API_KEY, CLIENT_ID, feed_token)
+              ws.on_open = on_open
+              ws.on_data = on_data
+              ws.on_error = on_error
+              ws.on_close = on_close
+              # Some SDK versions invoke on_open after connection; subscribe there.
+              original_on_open = on_open
+              def opened(wsapp):
+                  original_on_open(wsapp)
+                  try:
+                      on_connect(wsapp)
+                  except Exception as e:
+                      log(f"Subscribe error: {e}")
+              ws.on_open = opened
+          
+              status_thread = threading.Thread(target=status_loop, daemon=True)
+              status_thread.start()
+          
+              # Reconnect loop: if run_forever returns early, try again until 15:30.
+              try:
+                  while now_ist().time() < STOP:
                       try:
-                          scan_stock(
-                              api, name, stock, state, today, now
-                          )
-                      except Exception as error:
-                          log(
-                              f"ERROR {stock['symbol']}: "
-                              f"{type(error).__name__}: {error}"
-                          )
-
-                      if count % 10 == 0:
-                          save_state(state)
-                          log(
-                              f"Progress: {count}/{len(stocks)} stocks"
-                          )
-
-                      # Keep requests spaced to reduce API pressure.
-                      time.sleep(0.55)
-
-                  save_state(state)
-                  log("SELL scan completed")
-
+                          log("Connecting WebSocket...")
+                          ws.connect()
+                      except Exception as e:
+                          ws_ready = False
+                          log(f"WebSocket connect exception: {e}")
+                      if now_ist().time() < STOP:
+                          log("WebSocket disconnected; reconnecting in 10 seconds...")
+                          time.sleep(10)
               finally:
                   try:
-                      api.terminateSession(
-                          os.environ["ANGEL_CLIENT_ID"].strip()
-                      )
-                  except Exception as error:
-                      log(f"Session close warning: {error}")
-
+                      save_caches()
+                  except Exception as e:
+                      log(f"Cache save error: {e}")
+                  try:
+                      if ws:
+                          ws.close_connection()
+                  except Exception:
+                      pass
+                  telegram(
+                      "🏁 NSE F&O scanner stopped\n"
+                      f"Time: {now_ist():%H:%M:%S} IST\n"
+                      f"SELL alerts today: {len(alerted)}\n"
+                      "Alert-only mode; no orders placed."
+                  )
+                  log("Scanner stopped.")
+          
           if __name__ == "__main__":
               main()
-          PYTHON
 
-          python -u sell_scanner.py
+          PYTHON_SCRIPT
+          python -u scanner.py
 
-      - name: Save SELL scanner state
+      - name: Commit scanner cache/state
         if: always()
         run: |
-          if [ -f sell_scanner_state.json ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add sell_scanner_state.json
-
-            if ! git diff --cached --quiet; then
-              git commit -m "Update SELL scanner state"
-              git push
-            fi
-          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+users.noreply.github.com"
+          git add previous_day_ohlc.json scanner_state.json || true
+          git diff --cached --quiet || git commit -m "Update scanner cache [skip ci]"
+          git push || true
