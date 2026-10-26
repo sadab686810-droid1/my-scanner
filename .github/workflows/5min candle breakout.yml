@@ -18,7 +18,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -310,31 +310,21 @@ jobs:
 
           def status(state, total, errors):
               now = datetime.now(IST)
-              last_status = float(state.get("last_status", 0) or 0)
-              if now.timestamp() - last_status < STATUS_GAP:
-                  log("5-minute status interval has not elapsed")
-                  return
-
               daily_checked = len(state["daily"])
               eligible = sum(
                   bool(value.get("pass")) for value in state["daily"].values()
               )
-              message = (
-                  "📡 NSE F&O SCANNER — 5-MIN UPDATE\n"
-                  "━━━━━━━━━━━━━━━━━━\n"
-                  f"Time: {now:%H:%M:%S} IST\n"
-                  f"Mapped F&O stocks: {total}\n"
-                  f"Daily candles checked: {daily_checked}\n"
-                  f"Previous-day filter PASS: {eligible}\n"
-                  f"09:15 highs saved: {len(state['opening'])}\n"
-                  f"BUY alerts today: {len(state['alerted'])}\n"
-                  f"Stocks with scan errors this run: {errors}\n"
-                  "Scan cycle completed. No auto orders."
+              log(
+                  "SCAN SUMMARY | "
+                  f"Time: {now:%H:%M:%S} IST | "
+                  f"Mapped F&O stocks: {total} | "
+                  f"Daily candles checked: {daily_checked} | "
+                  f"Previous-day filter PASS: {eligible} | "
+                  f"09:15 highs saved: {len(state['opening'])} | "
+                  f"BUY alerts today: {len(state['alerted'])} | "
+                  f"Stocks with scan errors this run: {errors} | "
+                  "No auto orders."
               )
-              send(message)
-              state["last_status"] = now.timestamp()
-              save(state)
-              log("5-minute status update sent")
 
           def main():
               now = datetime.now(IST)
