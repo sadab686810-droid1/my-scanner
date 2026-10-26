@@ -177,16 +177,40 @@ jobs:
                       if n:
                           fno_names.add(n)
               result = {}
+              nse_eq_rows = 0
+              # In Angel's master, NSE cash EQ rows are reliably identified by
+              # exch_seg=NSE and symbol ending in -EQ. instrumenttype may be blank,
+              # so do not require instrumenttype == "EQ".
               for x in rows:
-                  if x.get("exch_seg") == "NSE" and x.get("instrumenttype") == "EQ":
-                      sym = x.get("symbol", "").upper().strip()
-                      # Master symbols usually have suffix -EQ.
-                      base = sym[:-3] if sym.endswith("-EQ") else sym
-                      token = str(x.get("token", "")).strip()
-                      if base in fno_names and token:
-                          result[base] = token
+                  if str(x.get("exch_seg", "")).upper().strip() != "NSE":
+                      continue
+                  sym = str(x.get("symbol", "")).upper().strip()
+                  if not sym.endswith("-EQ"):
+                      continue
+                  nse_eq_rows += 1
+                  base_symbol = sym[:-3].strip()
+                  token = str(x.get("token", "")).strip()
+                  if base_symbol in fno_names and token:
+                      result[base_symbol] = token
+
               if not result:
-                  raise RuntimeError("Could not map any NSE EQ tokens to NFO FUTSTK names.")
+                  # Helpful diagnostics to identify instrument-master schema differences.
+                  sample_nfo = [
+                      {k: x.get(k) for k in ("exch_seg", "instrumenttype", "name", "symbol", "token")}
+                      for x in rows
+                      if str(x.get("exch_seg", "")).upper().strip() == "NFO"
+                      and "FUT" in str(x.get("instrumenttype", "")).upper()
+                  ][:3]
+                  sample_nse = [
+                      {k: x.get(k) for k in ("exch_seg", "instrumenttype", "name", "symbol", "token")}
+                      for x in rows
+                      if str(x.get("exch_seg", "")).upper().strip() == "NSE"
+                  ][:3]
+                  raise RuntimeError(
+                      "Could not map NSE cash tokens to NFO FUTSTK names. "
+                      f"NFO FUTSTK names={len(fno_names)}, NSE -EQ rows={nse_eq_rows}; "
+                      f"NFO samples={sample_nfo}; NSE samples={sample_nse}"
+                  )
               log(f"F&O stocks mapped to NSE cash tokens: {len(result)}")
               return result
           
