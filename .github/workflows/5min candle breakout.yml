@@ -234,14 +234,15 @@ jobs:
               s['last_status'] = now.timestamp()
               save(s)
               log('5-minute status sent')
+              
           def telegram(message):
-              send(message)
+             send(message)
           def main():
               now = datetime.now(IST)
 
               if now.weekday() >= 5 or not (
                   dtime(9, 15) <= now.time() <= dtime(15, 30)
-                  ):
+              ):
                   log("Outside NSE market hours")
                   return
 
