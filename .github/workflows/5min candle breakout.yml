@@ -2,10 +2,7 @@ name: NSE FNO 5 Minute Breakout Scanner
 
 on:
   schedule:
-    # UTC: 03:45-09:55 = 09:15-15:25 IST; final 10:00 = 15:30 IST
-    - cron: '*/5 4-9 * * 1-5'
-    - cron: '45,50,55 3 * * 1-5'
-    - cron: '0 10 * * 1-5'
+    - cron: "*/5 3-10 * * 1-5"
   workflow_dispatch:
 
 permissions:
@@ -24,11 +21,16 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
+
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
+
       - name: Install dependencies
-        run: python -m pip install smartapi-python pyotp requests logzero websocket-client
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install smartapi-python pyotp requests logzero websocket-client
+
       - name: Scan NSE FNO
         env:
           ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
@@ -39,266 +41,306 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           cat > /tmp/fno_scanner.py <<'PYTHON'
-          import os, json, time, requests, pyotp
+          import json
+          import os
+          import time
           from datetime import datetime, timedelta, time as dtime
           from zoneinfo import ZoneInfo
+
+          import pyotp
+          import requests
           from SmartApi import SmartConnect
 
-          IST = ZoneInfo('Asia/Kolkata')
-          STATE = 'scanner_state.json'
-          MASTER = 'OpenAPIScripMaster.json'
-          MASTER_URL = 'https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json'
+          IST = ZoneInfo("Asia/Kolkata")
+          STATE = "scanner_state.json"
+          MASTER_URL = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
           REQUEST_GAP = 0.45
           STATUS_GAP = 300
           BODY_MIN = 70.0
-          # One exchange tick tolerance; set to 0 for exact equality.
           OPEN_LOW_TOLERANCE = 0.01
+          MARKET_START = dtime(9, 15)
+          MARKET_END = dtime(15, 30)
 
           def log(msg):
-              print(f'[{datetime.now(IST):%H:%M:%S}] {msg}', flush=True)
+              print(f"[{datetime.now(IST):%H:%M:%S}] {msg}", flush=True)
 
           def env(name):
-              value = os.getenv(name, '').strip()
+              value = os.getenv(name, "").strip()
               if not value:
-                  raise RuntimeError(f'Missing secret: {name}')
+                  raise RuntimeError(f"Missing GitHub Actions secret: {name}")
               return value
 
           def send(msg):
-              r = requests.post(
-                  f'https://api.telegram.org/bot{env("TELEGRAM_BOT_TOKEN")}/sendMessage',
-                  data={'chat_id': env('TELEGRAM_CHAT_ID'), 'text': msg}, timeout=20)
-              r.raise_for_status()
-              if not r.json().get('ok'):
-                  raise RuntimeError(f'Telegram error: {r.text[:300]}')
+              response = requests.post(
+                  f"https://api.telegram.org/bot{env('TELEGRAM_BOT_TOKEN')}/sendMessage",
+                  data={"chat_id": env("TELEGRAM_CHAT_ID"), "text": msg},
+                  timeout=20,
+              )
+              response.raise_for_status()
+              result = response.json()
+              if not result.get("ok"):
+                  raise RuntimeError(f"Telegram API error: {response.text[:300]}")
 
           def load_state(today):
               try:
-                  with open(STATE, encoding='utf-8') as f:
-                      s = json.load(f)
-                  if s.get('date') == today:
-                      for key, default in [('daily', {}), ('opening', {}),
-                                           ('alerted', {}), ('last_status', 0)]:
-                          s.setdefault(key, default)
-                      return s
+                  with open(STATE, encoding="utf-8") as source:
+                      state = json.load(source)
+                  if state.get("date") == today:
+                      state.setdefault("daily", {})
+                      state.setdefault("opening", {})
+                      state.setdefault("alerted", {})
+                      state.setdefault("last_status", 0)
+                      return state
               except (OSError, ValueError):
                   pass
-              return {'date': today, 'daily': {}, 'opening': {},
-                      'alerted': {}, 'last_status': 0}
+              return {"date": today, "daily": {}, "opening": {}, "alerted": {}, "last_status": 0}
 
-          def save(s):
-              with open(STATE + '.tmp', 'w', encoding='utf-8') as f:
-                  json.dump(s, f)
-              os.replace(STATE + '.tmp', STATE)
+          def save(state):
+              temp = STATE + ".tmp"
+              with open(temp, "w", encoding="utf-8") as output:
+                  json.dump(state, output, separators=(",", ":"))
+              os.replace(temp, STATE)
 
-          def ts(c):
-              dt = datetime.fromisoformat(str(c[0]))
+          def candle_time(candle):
+              dt = datetime.fromisoformat(str(candle[0]))
               return dt.replace(tzinfo=IST) if dt.tzinfo is None else dt.astimezone(IST)
 
           def get_master():
-              for attempt in range(3):
+              last_error = None
+              for attempt in range(1, 4):
                   try:
-                      r = requests.get(MASTER_URL, timeout=90)
-                      r.raise_for_status()
-                      rows = r.json()
+                      log(f"Downloading Angel instrument master ({attempt}/3)")
+                      response = requests.get(
+                          MASTER_URL, timeout=90,
+                          headers={"User-Agent": "Mozilla/5.0"},
+                      )
+                      response.raise_for_status()
+                      rows = response.json()
                       if not isinstance(rows, list) or not rows:
-                          raise ValueError('Invalid instrument master')
+                          raise ValueError("Invalid or empty instrument master")
+                      log(f"Instrument master records: {len(rows)}")
                       return rows
-                  except (requests.RequestException, ValueError) as e:
-                      log(f'Master retry {attempt+1}: {e}')
-                      time.sleep(2)
-              raise RuntimeError('Cannot download Angel instrument master')
+                  except (requests.RequestException, ValueError) as exc:
+                      last_error = exc
+                      log(f"Master download failed: {exc}")
+                      time.sleep(attempt * 2)
+              raise RuntimeError(f"Cannot download valid Angel instrument master: {last_error}")
 
           def stocks_from_master(rows):
-              names = {str(x.get('name', '')).upper().strip() for x in rows
-                       if x.get('exch_seg') == 'NFO'
-                       and x.get('instrumenttype') == 'FUTSTK'}
+              fno_names = {
+                  str(row.get("name", "")).strip().upper()
+                  for row in rows
+                  if row.get("exch_seg") == "NFO"
+                  and row.get("instrumenttype") == "FUTSTK"
+                  and row.get("name")
+              }
               stocks = {}
-              for x in rows:
-                  sym = str(x.get('symbol', '')).strip()
-                  token = str(x.get('token', '')).strip()
-                  if x.get('exch_seg') == 'NSE' and sym.endswith('-EQ') and token:
-                      name = sym[:-3].upper()
-                      if name in names:
+              for row in rows:
+                  symbol = str(row.get("symbol", "")).strip()
+                  token = str(row.get("token", "")).strip()
+                  if row.get("exch_seg") == "NSE" and symbol.endswith("-EQ") and token:
+                      name = symbol[:-3].upper()
+                      if name in fno_names:
                           stocks[name] = token
               if not stocks:
-                  raise RuntimeError('No NSE FNO equity symbols mapped')
+                  raise RuntimeError("No NSE F&O equity symbols mapped from instrument master")
               return dict(sorted(stocks.items()))
 
-          def candles(api, token, interval, start, end):
-              params = {'exchange': 'NSE', 'symboltoken': token,
-                        'interval': interval, 'fromdate': start, 'todate': end}
+          def get_candles(api, token, interval, start, end):
+              params = {
+                  "exchange": "NSE", "symboltoken": str(token),
+                  "interval": interval, "fromdate": start, "todate": end,
+              }
+              last_error = None
               for attempt in range(2):
                   time.sleep(REQUEST_GAP)
                   try:
-                      r = api.getCandleData(params)
-                      if r and r.get('status'):
-                          return r.get('data') or []
-                      log(f'{interval} token {token}: {str(r)[:180]}')
-                  except Exception as e:
-                      log(f'{interval} token {token}: {e}')
+                      result = api.getCandleData(params)
+                      if result and result.get("status"):
+                          return result.get("data") or []
+                      last_error = RuntimeError(f"API status false: {str(result)[:180]}")
+                      log(f"{interval} token {token}: {last_error}")
+                  except Exception as exc:
+                      last_error = exc
+                      log(f"{interval} token {token} error: {exc}")
                   if attempt == 0:
                       time.sleep(1.5)
+              log(f"Could not fetch {interval} candles token={token}: {last_error}")
               return None
 
-          def previous_day(api, token, today, now):
-              start = (now.date() - timedelta(days=14)).strftime('%Y-%m-%d 00:00')
-              rows = candles(api, token, 'ONE_DAY', start, now.strftime('%Y-%m-%d %H:%M'))
+          def previous_day_filter(api, token, now):
+              start = (now.date() - timedelta(days=14)).strftime("%Y-%m-%d 00:00")
+              rows = get_candles(api, token, "ONE_DAY", start, now.strftime("%Y-%m-%d %H:%M"))
               if rows is None:
                   return None
               prior = []
-              for c in rows:
+              for candle in rows:
                   try:
-                      if len(c) >= 5 and ts(c).date() < now.date():
-                          prior.append(c)
+                      if len(candle) >= 5 and candle_time(candle).date() < now.date():
+                          prior.append(candle)
                   except (ValueError, TypeError, IndexError):
                       continue
               if not prior:
+                  log(f"Token {token}: no previous completed daily candle returned")
                   return None
-              c = max(prior, key=ts)
+              candle = max(prior, key=candle_time)
               try:
-                  o, h, l, close = map(float, c[1:5])
-                  rng = h-l
-                  body = 100*(close-o)/rng if rng > 0 else 0
-                  passed = rng > 0 and close > o and abs(o-l) <= OPEN_LOW_TOLERANCE and body >= BODY_MIN
-                  return {'pass': bool(passed), 'date': ts(c).date().isoformat(),
-                          'body': round(body, 2)}
-              except (ValueError, TypeError):
+                  open_price, high, low, close = map(float, candle[1:5])
+                  candle_range = high - low
+                  body_percent = ((close - open_price) / candle_range * 100.0) if candle_range > 0 else 0.0
+                  open_equals_low = abs(open_price - low) <= OPEN_LOW_TOLERANCE
+                  passed = candle_range > 0 and close > open_price and open_equals_low and body_percent >= BODY_MIN
+                  return {
+                      "pass": bool(passed),
+                      "date": candle_time(candle).date().isoformat(),
+                      "body": round(body_percent, 2),
+                  }
+              except (ValueError, TypeError, IndexError):
                   return None
 
-          def scan_one(api, name, token, s, today, now):
-              if name not in s['daily']:
-                  d = previous_day(api, token, today, now)
-                  if d is None:
+          def scan_one(api, name, token, state, today):
+              if name not in state["daily"]:
+                  result = previous_day_filter(api, token, datetime.now(IST))
+                  if result is None:
                       return
-                  s['daily'][name] = d
-                  if d['pass']:
-                      log(f'{name} DAILY PASS body={d["body"]}%')
-              d = s['daily'][name]
-              if not d['pass'] or name in s['alerted']:
+                  state["daily"][name] = result
+                  log(f"{name}: previous daily {result['date']} filter={'PASS' if result['pass'] else 'FAIL'} body={result['body']}%")
+
+              daily = state["daily"][name]
+              if not daily["pass"] or name in state["alerted"]:
                   return
-              rows = candles(api, token, 'FIVE_MINUTE', today+' 09:15',
-                             now.strftime('%Y-%m-%d %H:%M'))
+
+              now = datetime.now(IST)
+              rows = get_candles(api, token, "FIVE_MINUTE", f"{today} 09:15", now.strftime("%Y-%m-%d %H:%M"))
               if rows is None:
                   return
-              valid = []
-              for c in rows:
+
+              completed = []
+              for candle in rows:
                   try:
-                      if len(c) >= 5 and ts(c) + timedelta(minutes=5) <= now:
-                          valid.append(c)
+                      if len(candle) >= 5 and candle_time(candle) + timedelta(minutes=5) <= now:
+                          completed.append(candle)
                   except (ValueError, TypeError, IndexError):
-                      pass
-              valid.sort(key=ts)
-              opening = next((c for c in valid if ts(c).strftime('%H:%M') == '09:15'), None)
+                      continue
+              completed.sort(key=candle_time)
+
+              opening = next((c for c in completed if candle_time(c).strftime("%H:%M") == "09:15"), None)
               if opening is None:
+                  log(f"{name}: completed 09:15 candle not returned yet")
                   return
-              if name not in s['opening']:
-                  s['opening'][name] = float(opening[2])
-                  log(f'{name} opening high={s["opening"][name]}')
-              opening_high = s['opening'][name]
-              for c in valid:
-                  if ts(c) <= ts(opening):
+
+              if name not in state["opening"]:
+                  state["opening"][name] = float(opening[2])
+                  log(f"{name}: saved 09:15 high={state['opening'][name]:.2f}")
+
+              opening_high = float(state["opening"][name])
+              for candle in completed:
+                  if candle_time(candle) <= candle_time(opening):
                       continue
                   try:
-                      close = float(c[4])
-                  except (ValueError, TypeError):
+                      close = float(candle[4])
+                  except (ValueError, TypeError, IndexError):
                       continue
                   if close > opening_high:
-                      msg = ('🟢 NSE F&O BREAKOUT BUY\n'
-                             f'Stock: {name}-EQ\n'
-                             f'Previous daily: {d["date"]}\n'
-                             f'Previous daily Open=Low, body: {d["body"]}%\n'
-                             f'Today 09:15 high: ₹{opening_high:.2f}\n'
-                             f'Breakout candle: {ts(c):%H:%M} IST\n'
-                             f'5-min close: ₹{close:.2f}\n'
-                             'Alert only; no order placed.')
-                      send(msg)
-                      s['alerted'][name] = str(c[0])
-                      save(s)
-                      log(f'BUY {name} {ts(c):%H:%M}')
+                      breakout_time = candle_time(candle)
+                      message = (
+                          "🟢 NSE F&O BREAKOUT BUY\n"
+                          "━━━━━━━━━━━━━━━━━━\n"
+                          f"Stock: {name}-EQ\n"
+                          f"Previous daily candle: {daily['date']}\n"
+                          f"Previous daily body: {daily['body']}% (Open=Low, bullish)\n"
+                          f"Today's 09:15 high: ₹{opening_high:.2f}\n"
+                          f"Breakout candle: {breakout_time:%H:%M} IST\n"
+                          f"5-minute close: ₹{close:.2f}\n"
+                          "Alert only; no order placed."
+                      )
+                      send(message)
+                      state["alerted"][name] = str(candle[0])
+                      save(state)
+                      log(f"BUY alert sent: {name} close={close:.2f}")
                       return
 
-          def status(s, total):
+          def status(state, total, errors):
               now = datetime.now(IST)
-              if now.timestamp() - float(s.get('last_status', 0)) < STATUS_GAP:
+              last_status = float(state.get("last_status", 0) or 0)
+              if now.timestamp() - last_status < STATUS_GAP:
+                  log("5-minute status interval has not elapsed")
                   return
-              eligible = sum(bool(v['pass']) for v in s['daily'].values())
-              msg = ('📡 NSE F&O SCANNER — 5-MIN UPDATE\n'
-                     f'Time: {now:%H:%M:%S} IST\n'
-                     f'Mapped F&O stocks: {total}\n'
-                     f'Daily candles checked: {len(s["daily"])}\n'
-                     f'Previous-day filter PASS: {eligible}\n'
-                     f'09:15 highs saved: {len(s["opening"])}\n'
-                     f'BUY alerts today: {len(s["alerted"])}\n'
-                     'Scan cycle completed. No auto orders.')
-              send(msg)
-              s['last_status'] = now.timestamp()
-              save(s)
-              log('5-minute status sent')
-              
-          def telegram(message):
-             send(message)
+              daily_checked = len(state["daily"])
+              eligible = sum(bool(value.get("pass")) for value in state["daily"].values())
+              message = (
+                  "📡 NSE F&O SCANNER — 5-MIN UPDATE\n"
+                  "━━━━━━━━━━━━━━━━━━\n"
+                  f"Time: {now:%H:%M:%S} IST\n"
+                  f"Mapped F&O stocks: {total}\n"
+                  f"Daily candles checked: {daily_checked}\n"
+                  f"Previous-day filter PASS: {eligible}\n"
+                  f"09:15 highs saved: {len(state['opening'])}\n"
+                  f"BUY alerts today: {len(state['alerted'])}\n"
+                  f"Stocks with scan errors this run: {errors}\n"
+                  "Scan cycle completed. No auto orders."
+              )
+              send(message)
+              state["last_status"] = now.timestamp()
+              save(state)
+              log("5-minute status update sent")
+
           def main():
               now = datetime.now(IST)
-
-              if now.weekday() >= 5 or not (
-                  dtime(9, 15) <= now.time() <= dtime(15, 30)
-              ):
-                  log("Outside NSE market hours")
+              log(f"Workflow started at {now:%Y-%m-%d %H:%M:%S} IST")
+              if now.weekday() >= 5 or not (MARKET_START <= now.time() <= MARKET_END):
+                  log("Outside NSE market hours; no market scan performed")
                   return
 
-               today = now.date().isoformat()
-               s = load_state(today)
-
-              if now.weekday() >= 5 or not (
-                 dtime(9, 15) <= now.time() <= dtime(15, 30)
-              ):
-               log("Outside NSE market hours")
-               return
               today = now.date().isoformat()
-              s = load_state(today)
-              client = env('ANGEL_CLIENT_ID')
-              totp = env('ANGEL_TOTP')
-              otp = totp if len(totp) == 6 and totp.isdigit() else pyotp.TOTP(totp).now()
-              api = SmartConnect(api_key=env('ANGEL_API_KEY'))
-              result = api.generateSession(client, env('ANGEL_PASSWORD'), otp)
-              if not result or not result.get('status'):
-                  raise RuntimeError(f'Angel login failed: {result}')
+              state = load_state(today)
+              client = env("ANGEL_CLIENT_ID")
+              totp_value = env("ANGEL_TOTP")
+              otp = totp_value if len(totp_value) == 6 and totp_value.isdigit() else pyotp.TOTP(totp_value).now()
+              api = SmartConnect(api_key=env("ANGEL_API_KEY"))
+              login_result = api.generateSession(client, env("ANGEL_PASSWORD"), otp)
+              if not login_result or not login_result.get("status"):
+                  raise RuntimeError(f"Angel One login failed: {login_result}")
+
               try:
                   stocks = stocks_from_master(get_master())
-                  log(f'Mapped {len(stocks)} FNO stocks')
+                  total = len(stocks)
+                  log(f"Mapped {total} NSE F&O stocks")
                   errors = 0
-                  for i, (name, token) in enumerate(stocks.items(), 1):
+                  for index, (name, token) in enumerate(stocks.items(), 1):
                       try:
-                          scan_one(api, name, token, s, today, now)
-                      except Exception as e:
+                          scan_one(api, name, token, state, today)
+                      except Exception as exc:
                           errors += 1
-                          log(f'ERROR {name}: {e}')
-                      if i % 10 == 0:
-                          save(s)
-                          log(f'Progress {i}/{len(stocks)}')
-                  save(s)
-                  status(s, len(stocks))
-                  log(f'Completed. Stock errors: {errors}')
+                          log(f"ERROR {name}: {exc}")
+                      if index % 10 == 0:
+                          save(state)
+                          log(f"Progress {index}/{total}")
+                      time.sleep(REQUEST_GAP)
+                  save(state)
+                  status(state, total, errors)
+                  log(f"Scan completed. Stock errors: {errors}")
               finally:
                   try:
                       api.terminateSession(client)
-                  except Exception:
-                      pass
+                  except Exception as exc:
+                      log(f"Session termination warning: {exc}")
 
-          if __name__ == '__main__':
+          if __name__ == "__main__":
               main()
           PYTHON
+          python -m py_compile /tmp/fno_scanner.py
           python -u /tmp/fno_scanner.py
 
       - name: Commit scanner state
         if: always()
         run: |
           if [ -s scanner_state.json ]; then
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add scanner_state.json
             if ! git diff --cached --quiet; then
-              git commit -m 'Save scanner state [skip ci]'
+              git commit -m "Save scanner state [skip ci]"
               git pull --rebase origin "${{ github.event.repository.default_branch }}"
               git push origin HEAD:"${{ github.event.repository.default_branch }}"
             fi
