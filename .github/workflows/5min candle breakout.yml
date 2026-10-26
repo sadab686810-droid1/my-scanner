@@ -54,7 +54,7 @@ jobs:
           IST = ZoneInfo("Asia/Kolkata")
           STATE = "scanner_state.json"
           MASTER_URL = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
-          REQUEST_GAP = 2
+          REQUEST_GAP = 0.50
           STATUS_GAP = 300
           BODY_MIN = 70.0
           OPEN_LOW_TOLERANCE = 0.01
@@ -164,7 +164,7 @@ jobs:
                       last_error = exc
                       log(f"{interval} token {token} error: {exc}")
                   if attempt == 0:
-                      time.sleep(8)
+                      time.sleep(2)
               log(f"Could not fetch {interval} candles token={token}: {last_error}")
               return None
 
