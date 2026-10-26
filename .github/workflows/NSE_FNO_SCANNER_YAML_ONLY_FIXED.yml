@@ -276,19 +276,33 @@ jobs:
                       log(f"Bhavcopy download failed for {d.isoformat()}: {e}")
               return None
           
+          filter_counts = {"ohlc": 0, "open_low": 0, "bullish": 0, "body70": 0, "eligible": 0, "bad_row": 0}
+
           def previous_day_filter(symbol, row):
               try:
                   o, h, l, c = [float(row[k]) for k in ("open", "high", "low", "close")]
+                  filter_counts["ohlc"] += 1
                   rng = h - l
                   if rng <= 0:
+                      log(f"FILTER REJECT {symbol}: invalid range High={h} Low={l}")
                       return False
-                  body_pct = ((c - o) / rng) * 100.0
                   open_is_low = round(o, 2) == round(l, 2)
-                  passed = c > o and open_is_low and body_pct >= BODY_MIN_PERCENT
+                  bullish = c > o
+                  body_pct = ((c - o) / rng) * 100.0
+                  if open_is_low:
+                      filter_counts["open_low"] += 1
+                  if bullish:
+                      filter_counts["bullish"] += 1
+                  if body_pct >= BODY_MIN_PERCENT:
+                      filter_counts["body70"] += 1
+                  passed = bullish and open_is_low and body_pct >= BODY_MIN_PERCENT
                   if passed:
-                      log(f"ELIGIBLE {symbol}: previous-day bullish, Open≈Low, body={body_pct:.1f}%")
+                      filter_counts["eligible"] += 1
+                      log(f"ELIGIBLE {symbol}: O={o:.2f} H={h:.2f} L={l:.2f} C={c:.2f} body={body_pct:.1f}%")
                   return passed
-              except Exception:
+              except Exception as e:
+                  filter_counts["bad_row"] += 1
+                  log(f"FILTER DATA ERROR {symbol}: {e}; row={row}")
                   return False
           
           def candle_api(exchange, token, interval, from_dt, to_dt):
@@ -506,9 +520,25 @@ jobs:
                   if row and previous_day_filter(sym, row):
                       eligible[sym] = stock_tokens[sym]
           
+              log(
+                  "PREVIOUS-DAY FILTER SUMMARY: "
+                  f"OHLC rows={filter_counts['ohlc']}, "
+                  f"Open=Low={filter_counts['open_low']}, "
+                  f"Bullish={filter_counts['bullish']}, "
+                  f"Body>=70%={filter_counts['body70']}, "
+                  f"Eligible={filter_counts['eligible']}, "
+                  f"Bad rows={filter_counts['bad_row']}"
+              )
               if not eligible:
-                  telegram("⚠️ Scanner started, but no stocks passed previous-day cache filters.")
-                  log("No eligible stocks from previous-day cache.")
+                  telegram(
+                      "⚠️ No stocks passed previous-day filter.\n"
+                      f"OHLC rows: {filter_counts['ohlc']}\n"
+                      f"Open=Low: {filter_counts['open_low']}\n"
+                      f"Bullish: {filter_counts['bullish']}\n"
+                      f"Body >=70%: {filter_counts['body70']}\n"
+                      "No BUY monitoring started."
+                  )
+                  log("No eligible stocks from previous-day cache; see filter summary above.")
                   return
           
               # API opening candle fetch: after 09:20. Calls are rate-limited deliberately.
