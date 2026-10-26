@@ -1,11 +1,10 @@
 name: NSE FNO 5-Min Breakout Scanner (YAML Only)
 
 on:
-  
+  workflow_dispatch:
   schedule:
     # 09:05 IST Monday-Friday (GitHub cron uses UTC)
     - cron: "35 3 * * 1-5"
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -568,7 +567,7 @@ jobs:
           if __name__ == "__main__":
               main()
 
-PYTHON_SCRIPT
+          PYTHON_SCRIPT
           python -u scanner.py
 
       - name: Commit scanner cache/state
