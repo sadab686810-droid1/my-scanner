@@ -1,10 +1,11 @@
 name: NSE FNO 5-Min Breakout Scanner (YAML Only)
 
 on:
-  workflow_dispatch:
+  
   schedule:
     # 09:05 IST Monday-Friday (GitHub cron uses UTC)
-    - cron: "5 3 * * 1-5"
+    - cron: "35 3 * * 1-5"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -16,7 +17,7 @@ concurrency:
 jobs:
   scanner:
     runs-on: ubuntu-latest
-    timeout-minutes: 390
+    timeout-minutes: 350
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -61,7 +62,7 @@ jobs:
           
           IST = ZoneInfo("Asia/Kolkata")
           START = dtime(9, 15)
-          STOP = dtime(15, 30)
+          STOP = dtime(15, 0)
           STATUS_SECONDS = 300
           BODY_MIN_PERCENT = 70.0
           OPEN_LOW_TOLERANCE = 0.00  # exact equality after rounding to 2 decimals
@@ -566,6 +567,7 @@ jobs:
           
           if __name__ == "__main__":
               main()
+
 PYTHON_SCRIPT
           python -u scanner.py
 
