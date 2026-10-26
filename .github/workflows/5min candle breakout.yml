@@ -143,10 +143,32 @@ jobs:
               return jwt, feed
           
           def load_master():
-              log("Downloading Angel One instrument master...")
-              r = requests.get(MASTER_URL, timeout=45)
-              r.raise_for_status()
-              rows = r.json()
+              # Bounded download with retries so GitHub Actions never hangs here indefinitely.
+              last_error = None
+              rows = None
+              for attempt in range(1, 4):
+                  try:
+                      log(f"Downloading Angel One instrument master (attempt {attempt}/3)...")
+                      r = requests.get(
+                          MASTER_URL,
+                          headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+                          timeout=(10, 25)
+                      )
+                      r.raise_for_status()
+                      log(f"Instrument master HTTP {r.status_code}; response bytes={len(r.content)}")
+                      rows = r.json()
+                      if not isinstance(rows, list) or not rows:
+                          raise ValueError("Instrument master JSON is empty or not a list")
+                      break
+                  except Exception as e:
+                      last_error = e
+                      log(f"Instrument master attempt {attempt}/3 failed: {type(e).__name__}: {e}")
+                      if attempt < 3:
+                          wait_s = attempt * 5
+                          log(f"Retrying instrument master in {wait_s}s...")
+                          time.sleep(wait_s)
+              if rows is None:
+                  raise RuntimeError(f"Instrument master download failed after 3 attempts: {last_error}")
               # F&O stock universe from NFO FUTSTK; map to NSE EQ token.
               fno_names = set()
               for x in rows:
@@ -544,7 +566,7 @@ jobs:
           
           if __name__ == "__main__":
               main()
-          PYTHON_SCRIPT
+PYTHON_SCRIPT
           python -u scanner.py
 
       - name: Commit scanner cache/state
