@@ -3,7 +3,7 @@ name: NSE FNO 5-Min Breakout Scanner (YAML Only)
 on:
   
   schedule:
-    # 09:05 IST Monday-Friday (GitHub cron uses UTC)
+    # 09:05 IST = 3:30 UTC
     - cron: "30 3 * * 1-5"
   workflow_dispatch:
   
