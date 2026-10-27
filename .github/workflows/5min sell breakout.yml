@@ -3,7 +3,7 @@ name: NSE FNO 5-Min Breadown Scanner (YAML Only)
 on:
  
   schedule:
-    # 09:05 IST Monday-Friday (GitHub cron uses UTC)
+    # 09:05 IST = 3:40 UTC
     - cron: "35 3 * * 1-5"
   workflow_dispatch:
   
@@ -62,7 +62,7 @@ jobs:
           
           IST = ZoneInfo("Asia/Kolkata")
           START = dtime(9, 15)
-          STOP = dtime(15, 0)
+          STOP = dtime(15, 30)
           STATUS_SECONDS = 300
           BODY_MIN_PERCENT = 70.0
           OPEN_HIGH_TOLERANCE = 0.00  # exact equality after rounding to 2 decimals
