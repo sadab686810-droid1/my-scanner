@@ -62,7 +62,7 @@ jobs:
           
           IST = ZoneInfo("Asia/Kolkata")
           START = dtime(9, 15)
-          STOP = dtime(15, 0)
+          STOP = dtime(15, 30)
           STATUS_SECONDS = 300
           BODY_MIN_PERCENT = 70.0
           OPEN_LOW_TOLERANCE = 0.00  # exact equality after rounding to 2 decimals
